@@ -39,7 +39,7 @@ class SchedulerService:
         self.scheduler.shutdown(wait=False)
 
     def schedule_reminder(self, reminder_id: int, run_at_utc: datetime) -> None:
-        schedule_one_off_job(self.scheduler, reminder_id, run_at_utc, self.send_one_reminder)
+        schedule_one_off_job(self.scheduler, reminder_id, _as_utc_aware(run_at_utc), self.send_one_reminder)
 
     async def hydrate_pending_reminders(self) -> None:
         async with get_session() as session:
@@ -47,7 +47,8 @@ class SchedulerService:
             reminders = await store.pending_reminders()
             now = datetime.now(timezone.utc)
             for reminder in reminders:
-                if reminder.scheduled_for <= now:
+                run_at = _as_utc_aware(reminder.scheduled_for)
+                if run_at <= now:
                     self.scheduler.add_job(
                         self.send_one_reminder,
                         trigger="date",
@@ -57,7 +58,7 @@ class SchedulerService:
                         replace_existing=True,
                     )
                 else:
-                    self.schedule_reminder(reminder.id, reminder.scheduled_for)
+                    self.schedule_reminder(reminder.id, run_at)
 
     async def send_one_reminder(self, reminder_id: int) -> None:
         try:
@@ -114,3 +115,9 @@ class SchedulerService:
         except Exception as exc:
             logger.exception("Scheduled job failed: %s", job_name)
             await self.error_triage.handle_exception(exc, context=f"scheduler job failed: {job_name}")
+
+
+def _as_utc_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
