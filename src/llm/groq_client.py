@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from groq import AsyncGroq
 
-from src.config import GROQ_SUMMARY_MODEL, GROQ_TRIAGE_MODEL
+from src.config import GROQ_FALLBACK_CHAT_MODEL, GROQ_SUMMARY_MODEL, GROQ_TRIAGE_MODEL
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,26 @@ class GroqClient:
             system_prompt=system,
             user_prompt=prompt,
             max_tokens=800,
+        )
+
+    async def answer_with_fallback(self, prompt_context: str, user_text: str) -> str:
+        system = (
+            "You are Aika fallback assistant. Gemini is currently unavailable. "
+            "Answer the user directly and concisely using provided context only. "
+            "If a request requires unavailable tools, say so briefly."
+        )
+        prompt = (
+            "Conversation context:\n"
+            f"{prompt_context}\n\n"
+            "Current user message:\n"
+            f"{user_text}\n\n"
+            "Return only the assistant reply text."
+        )
+        return await self._chat(
+            model=GROQ_FALLBACK_CHAT_MODEL,
+            system_prompt=system,
+            user_prompt=prompt,
+            max_tokens=900,
         )
 
     async def build_solve_plan(self, prompt: str, context: Optional[str] = None) -> SolvePlan:

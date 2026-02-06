@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -170,34 +170,78 @@ class AgentOrchestrator:
             except GeminiQuotaExceededError as exc:
                 consume_pending = False
                 should_compress = False
+                fallback_text = await self._try_kimi_fallback(
+                    prompt_context=prompt,
+                    user_text=text,
+                    reason="gemini_quota_exceeded",
+                    telegram_user_id=telegram_user_id,
+                )
+                if fallback_text:
+                    final_text = fallback_text
+                    logger.warning("Served Kimi fallback for user %s after Gemini quota error", telegram_user_id)
+                    await store.store_tool_message(
+                        telegram_user_id,
+                        "fallback_model_used -> moonshotai/kimi-k2-instruct-0905 (reason=gemini_quota_exceeded)",
+                    )
+                    # Gemini could not process multimodal context reliably in this turn.
+                    consume_pending = False
+                    should_compress = True
+
                 wait_hint = (
                     f" Please retry in about {exc.retry_after_seconds} seconds."
                     if exc.retry_after_seconds
                     else ""
                 )
-                if exc.daily_quota_hit:
-                    final_text = (
-                        "Gemini API free-tier daily quota appears to be exhausted, so AI replies are temporarily unavailable."
-                        " Wait for quota reset or enable billing/increase quota in Google AI Studio."
-                        f"{wait_hint} /status still works."
-                    )
-                else:
-                    final_text = (
-                        "Gemini API quota is currently exhausted, so I cannot generate AI replies right now."
-                        f"{wait_hint} /status still works."
-                    )
+                if not final_text:
+                    if exc.daily_quota_hit:
+                        final_text = (
+                            "Gemini API free-tier daily quota appears to be exhausted, so AI replies are temporarily unavailable."
+                            " Wait for quota reset or enable billing/increase quota in Google AI Studio."
+                            f"{wait_hint} /status still works."
+                        )
+                    else:
+                        final_text = (
+                            "Gemini API quota is currently exhausted, so I cannot generate AI replies right now."
+                            f"{wait_hint} /status still works."
+                        )
                 logger.warning("Gemini quota exceeded while handling message for user %s", telegram_user_id)
             except Exception:
                 consume_pending = False
                 should_compress = False
                 logger.exception("Gemini pipeline failed for user %s", telegram_user_id)
-                final_text = "I hit a temporary AI backend error. Please try again shortly."
+                fallback_text = await self._try_kimi_fallback(
+                    prompt_context=prompt,
+                    user_text=text,
+                    reason="gemini_pipeline_exception",
+                    telegram_user_id=telegram_user_id,
+                )
+                if fallback_text:
+                    final_text = fallback_text
+                    await store.store_tool_message(
+                        telegram_user_id,
+                        "fallback_model_used -> moonshotai/kimi-k2-instruct-0905 (reason=gemini_pipeline_exception)",
+                    )
+                else:
+                    final_text = "I hit a temporary AI backend error. Please try again shortly."
 
             if not final_text:
-                final_text = (
-                    f"I reached the per-message Gemini turn limit ({max_model_turns}) before a final answer. "
-                    "Please retry with a narrower request."
+                fallback_text = await self._try_kimi_fallback(
+                    prompt_context=prompt,
+                    user_text=text,
+                    reason="gemini_turn_limit",
+                    telegram_user_id=telegram_user_id,
                 )
+                if fallback_text:
+                    final_text = fallback_text
+                    await store.store_tool_message(
+                        telegram_user_id,
+                        "fallback_model_used -> moonshotai/kimi-k2-instruct-0905 (reason=gemini_turn_limit)",
+                    )
+                else:
+                    final_text = (
+                        f"I reached the per-message Gemini turn limit ({max_model_turns}) before a final answer. "
+                        "Please retry with a narrower request."
+                    )
 
             await store.store_assistant_message(telegram_user_id, final_text, exchange_id=exchange_id)
             if should_compress:
@@ -261,9 +305,28 @@ class AgentOrchestrator:
         lines.append(f"Current user message: {user_text}")
         return "\n".join(lines)
 
+    async def _try_kimi_fallback(
+        self,
+        prompt_context: str,
+        user_text: str,
+        reason: str,
+        telegram_user_id: int,
+    ) -> Optional[str]:
+        try:
+            text = await self.groq.answer_with_fallback(prompt_context=prompt_context, user_text=user_text)
+        except Exception:
+            logger.exception("Kimi fallback failed for user %s (reason=%s)", telegram_user_id, reason)
+            return None
+
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return None
+        return cleaned
+
     def _system_instruction(self) -> str:
         return (
             "You can call tools for file operations, reminders, sandbox shell execution, and Raspberry Pi camera capture. "
+            "Use set_reminder to create reminders and list_reminders to inspect existing reminders for a person. "
             "Shared storage operations are forbidden unless explicitly allowed by user request. "
             "If a tool returns status=needs_confirmation, ask for confirmation and do not proceed."
         )
@@ -343,6 +406,18 @@ class AgentOrchestrator:
                         "target_user_id": {"type": "integer"},
                     },
                     "required": ["when", "text"],
+                },
+            ),
+            ToolSpec(
+                name="list_reminders",
+                description="List reminders for a user (default: current user).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "target_user_id": {"type": "integer"},
+                        "status": {"type": "string", "enum": ["pending", "sent", "all"]},
+                        "limit": {"type": "integer"},
+                    },
                 },
             ),
             ToolSpec(
@@ -467,6 +542,50 @@ class AgentOrchestrator:
             except Exception as exc:
                 return {"status": "error", "message": str(exc)}
 
+        if name == "list_reminders":
+            try:
+                target = int(args.get("target_user_id") or telegram_user_id)
+                if target != telegram_user_id and telegram_user_id not in settings.admin_user_ids:
+                    return {
+                        "status": "error",
+                        "message": "Only admins can list reminders for other users.",
+                    }
+
+                raw_status = str(args.get("status", "pending")).strip().lower()
+                if raw_status not in {"pending", "sent", "all"}:
+                    raw_status = "pending"
+                status = None if raw_status == "all" else raw_status
+
+                limit = _coerce_positive_int(args.get("limit")) or 20
+                limit = min(limit, 50)
+
+                rows = await store.list_reminders_for_user(
+                    target_user_id=target,
+                    status=status,
+                    limit=limit,
+                )
+
+                reminders = [
+                    {
+                        "id": int(row.id),
+                        "creator_user_id": int(row.creator_user_id),
+                        "target_user_id": int(row.target_user_id),
+                        "scheduled_for": _to_utc_iso(row.scheduled_for),
+                        "status": str(row.status),
+                        "text": str(row.text),
+                    }
+                    for row in rows
+                ]
+                return {
+                    "status": "ok",
+                    "target_user_id": target,
+                    "filter_status": raw_status,
+                    "count": len(reminders),
+                    "reminders": reminders,
+                }
+            except Exception as exc:
+                return {"status": "error", "message": str(exc)}
+
         if name == "camera_capture_for_ai":
             try:
                 label = str(args.get("label", "")).strip() or "camera_ai"
@@ -572,3 +691,11 @@ def _coerce_positive_int(value: Any) -> Optional[int]:
     if parsed <= 0:
         return None
     return parsed
+
+
+def _to_utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        aware = value.replace(tzinfo=timezone.utc)
+    else:
+        aware = value.astimezone(timezone.utc)
+    return aware.isoformat()

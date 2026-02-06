@@ -5,6 +5,7 @@ Production-lean Telegram agent server using:
 - Gemini (`google-genai`, model `gemini-3-flash-preview`) for default chat/tool orchestration
 - Groq (`qwen/qwen3-32b`) for all summarization
 - Groq (`openai/gpt-oss-120b`) for error triage and admin solve planning
+- Groq (`moonshotai/kimi-k2-instruct-0905`) as fallback responder when Gemini fails
 - SQLite + SQLAlchemy for state/memory
 - APScheduler for reminders and background jobs
 - Per-invocation sandbox execution using ephemeral Docker containers
@@ -312,7 +313,7 @@ pytest -q tests
 - If logs show `429 RESOURCE_EXHAUSTED` from Gemini:
   - This means your Gemini quota is exhausted (often free-tier daily request cap).
   - The bot now puts the exhausted key on cooldown and auto-rotates to `GEMINI_API_KEY_FALLBACK` / `GEMINI_API_KEY_FALLBACKS` if configured.
-  - If all keys are exhausted, it returns a user-friendly message instead of failing updates.
+  - If all keys are exhausted, it tries Groq Kimi fallback to still answer the message.
   - Fix by waiting for quota reset or enabling billing/higher limits in Google AI Studio.
 - If you get `per-message Gemini turn limit`:
   - Increase `GEMINI_MAX_CALLS_PER_MESSAGE` and/or `GEMINI_MAX_TOOL_CALLS_PER_MESSAGE`.

@@ -454,6 +454,26 @@ class MemoryStore:
         )
         return rows
 
+    async def list_reminders_for_user(
+        self,
+        target_user_id: int,
+        status: Optional[str] = "pending",
+        limit: int = 20,
+    ) -> list[Reminder]:
+        stmt = select(Reminder).where(Reminder.target_user_id == target_user_id)
+        if status:
+            stmt = stmt.where(Reminder.status == status)
+        rows = (
+            (
+                await self.session.execute(
+                    stmt.order_by(Reminder.scheduled_for.asc()).limit(max(1, int(limit)))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return rows
+
     async def due_reminders(self, now_utc: datetime) -> list[Reminder]:
         rows = (
             (

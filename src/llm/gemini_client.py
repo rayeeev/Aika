@@ -153,6 +153,9 @@ class GeminiClient:
         transient_failures = 0
         total_attempts = 0
         max_attempt_budget = self.max_retries + (len(self._states) * 2)
+        quota_failed_indexes: set[int] = set()
+        last_quota_error: str = ""
+        saw_daily_quota = False
 
         while total_attempts < max_attempt_budget:
             total_attempts += 1
@@ -171,8 +174,11 @@ class GeminiClient:
                 error_text = str(exc)
 
                 if _looks_like_quota_error(error_text):
+                    quota_failed_indexes.add(state_index)
                     retry_after = _extract_retry_after_seconds(error_text)
                     daily_quota_hit = _looks_like_daily_quota_limit(error_text)
+                    saw_daily_quota = saw_daily_quota or daily_quota_hit
+                    last_quota_error = error_text
                     cooldown = retry_after or self.min_quota_cooldown_seconds
                     if daily_quota_hit:
                         cooldown = max(cooldown, self.daily_quota_cooldown_seconds)
@@ -189,14 +195,24 @@ class GeminiClient:
                     )
 
                     if switched:
-                        continue
+                        if len(quota_failed_indexes) < len(self._states):
+                            continue
+
+                    if len(quota_failed_indexes) >= len(self._states):
+                        retry_wait = await self._min_retry_after_seconds()
+                        raise GeminiQuotaExceededError(
+                            message="All configured Gemini API keys returned quota errors on this request",
+                            retry_after_seconds=retry_wait,
+                            details=last_quota_error or error_text,
+                            daily_quota_hit=saw_daily_quota,
+                        ) from exc
 
                     retry_wait = await self._min_retry_after_seconds()
                     raise GeminiQuotaExceededError(
                         message="All Gemini keys exhausted or cooling down",
                         retry_after_seconds=retry_wait,
                         details=error_text,
-                        daily_quota_hit=daily_quota_hit,
+                        daily_quota_hit=saw_daily_quota,
                     ) from exc
 
                 if _looks_like_key_auth_error(error_text):
@@ -233,13 +249,11 @@ class GeminiClient:
                     self._active_state_index = idx
                     return idx
 
-            retry_after = self._min_retry_after_locked(now)
-
-        raise GeminiQuotaExceededError(
-            message="All Gemini API keys are cooling down",
-            retry_after_seconds=retry_after,
-            details="All configured Gemini keys are in cooldown",
-        )
+            # Soft cooldown behavior: if all keys are cooling down, still probe one key
+            # each request instead of blocking until cooldown expires.
+            fallback_idx = (self._active_state_index + 1) % total
+            self._active_state_index = fallback_idx
+            return fallback_idx
 
     async def _apply_cooldown(self, index: int, seconds: int) -> None:
         now = datetime.now(timezone.utc)
@@ -249,13 +263,13 @@ class GeminiClient:
             if state.cooldown_until is None or state.cooldown_until < cooldown_until:
                 state.cooldown_until = cooldown_until
             if self._active_state_index == index:
-                self._promote_available_state_locked(now, exclude_index=index)
+                self._promote_next_state_locked(now, exclude_index=index)
 
     async def _switch_active_state(self, exclude_index: Optional[int] = None) -> bool:
         now = datetime.now(timezone.utc)
         async with self._state_lock:
             self._clear_expired_cooldowns_locked(now)
-            return self._promote_available_state_locked(now, exclude_index=exclude_index)
+            return self._promote_next_state_locked(now, exclude_index=exclude_index)
 
     async def _min_retry_after_seconds(self) -> int:
         now = datetime.now(timezone.utc)
@@ -268,16 +282,24 @@ class GeminiClient:
             if state.cooldown_until is not None and state.cooldown_until <= now:
                 state.cooldown_until = None
 
-    def _promote_available_state_locked(self, now: datetime, exclude_index: Optional[int] = None) -> bool:
+    def _promote_next_state_locked(self, now: datetime, exclude_index: Optional[int] = None) -> bool:
         total = len(self._states)
+        fallback_idx: Optional[int] = None
         for offset in range(1, total + 1):
             idx = (self._active_state_index + offset) % total
             if exclude_index is not None and idx == exclude_index:
                 continue
             state = self._states[idx]
+            if fallback_idx is None:
+                fallback_idx = idx
             if state.cooldown_until is None or state.cooldown_until <= now:
                 self._active_state_index = idx
                 return True
+
+        if fallback_idx is not None:
+            # Soft cooldown fallback: rotate to another key even if it is still cooling.
+            self._active_state_index = fallback_idx
+            return True
         return False
 
     def _min_retry_after_locked(self, now: datetime) -> int:

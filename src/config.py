@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 GEMINI_MODEL = "gemini-3-flash-preview"
 GROQ_SUMMARY_MODEL = "qwen/qwen3-32b"
 GROQ_TRIAGE_MODEL = "openai/gpt-oss-120b"
+GROQ_FALLBACK_CHAT_MODEL = "moonshotai/kimi-k2-instruct-0905"
 
 
 @dataclass
