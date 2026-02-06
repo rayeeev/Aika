@@ -6,11 +6,10 @@ import re
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Awaitable, Callable, Iterable, Optional
 
 from aiogram import Bot
 
-from src.config import settings
 from src.llm.groq_client import GroqClient
 from src.utils.paths import PathResolver
 
@@ -18,6 +17,9 @@ from src.utils.paths import PathResolver
 logger = logging.getLogger(__name__)
 
 _FILE_RE = re.compile(r'File "([^"]+)", line (\d+)')
+
+
+AutoSolverCallback = Callable[[Path, str, str, str], Awaitable[None]]
 
 
 class ErrorTriageService:
@@ -28,6 +30,7 @@ class ErrorTriageService:
         bot: Bot,
         admin_user_ids: list[int],
         notify_cooldown_seconds: int = 300,
+        auto_solver_callback: Optional[AutoSolverCallback] = None,
     ) -> None:
         self.resolver = resolver
         self.groq = groq
@@ -35,6 +38,8 @@ class ErrorTriageService:
         self.admin_user_ids = admin_user_ids
         self.notify_cooldown = timedelta(seconds=notify_cooldown_seconds)
         self._last_notify_at: Optional[datetime] = None
+        self._last_auto_solve_at: Optional[datetime] = None
+        self.auto_solver_callback = auto_solver_callback
 
     async def handle_exception(
         self,
@@ -64,6 +69,14 @@ class ErrorTriageService:
         )
 
         await self._maybe_notify_admins(report_path)
+        if self.auto_solver_callback and not _looks_like_gemini_quota_issue(context=context, stack=stack):
+            now = datetime.now(timezone.utc)
+            if self._last_auto_solve_at is None or now - self._last_auto_solve_at >= self.notify_cooldown:
+                try:
+                    await self.auto_solver_callback(report_path, context, stack, triage_text)
+                    self._last_auto_solve_at = now
+                except Exception:
+                    logger.exception("Auto-solver callback failed for report %s", report_path)
         return report_path
 
     def _write_report(self, context: str, stack: str, snippets: str, triage: str) -> Path:
@@ -103,6 +116,14 @@ class ErrorTriageService:
 
         self._last_notify_at = now
 
+    def list_recent_reports(self, limit: int = 10) -> list[Path]:
+        report_dir = self.resolver.admin_dir / "error_reports"
+        if not report_dir.exists():
+            return []
+        files = [path for path in report_dir.glob("*.md") if path.is_file()]
+        files.sort(key=lambda path: path.name, reverse=True)
+        return files[: max(1, limit)]
+
 
 def _extract_files_from_stack(stack: str) -> list[str]:
     files: list[str] = []
@@ -137,3 +158,15 @@ def _load_snippets(paths: Iterable[str], max_files: int = 6, max_lines: int = 12
     if not chunks:
         return "(no snippets available)"
     return "\n\n".join(chunks)
+
+
+def _looks_like_gemini_quota_issue(context: str, stack: str) -> bool:
+    joined = f"{context}\n{stack}".lower()
+    signals = (
+        "resource_exhausted",
+        "quota exceeded",
+        "generate_content_free_tier_requests",
+        "generaterequestsperdayperprojectpermodel",
+        "geminiquotaexceedederror",
+    )
+    return any(signal in joined for signal in signals)

@@ -8,7 +8,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dateutil import parser as date_parser
 
 
-_IN_PATTERN = re.compile(r"^in\s+(\d+)\s*([mhd])$", re.IGNORECASE)
+_IN_PATTERN = re.compile(
+    r"^in\s+(\d+)\s*(m|h|d|mins?|minutes?|hrs?|hours?|days?)$",
+    re.IGNORECASE,
+)
 
 
 def parse_reminder_time(raw: str, timezone_name: str) -> datetime:
@@ -19,11 +22,12 @@ def parse_reminder_time(raw: str, timezone_name: str) -> datetime:
     if in_match:
         amount = int(in_match.group(1))
         unit = in_match.group(2).lower()
-        delta = {
-            "m": timedelta(minutes=amount),
-            "h": timedelta(hours=amount),
-            "d": timedelta(days=amount),
-        }[unit]
+        if unit in {"m", "min", "mins", "minute", "minutes"}:
+            delta = timedelta(minutes=amount)
+        elif unit in {"h", "hr", "hrs", "hour", "hours"}:
+            delta = timedelta(hours=amount)
+        else:
+            delta = timedelta(days=amount)
         return (now_local + delta).astimezone(timezone.utc)
 
     if value.lower().startswith("tomorrow"):

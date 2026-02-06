@@ -34,6 +34,7 @@ class Settings:
     timezone: str
     sqlite_path: Path
     gemini_max_calls_per_message: int
+    gemini_max_tool_calls_per_message: int
     gemini_max_retries: int
     gemini_retry_base_delay_seconds: float
     gemini_quota_cooldown_seconds: int
@@ -88,7 +89,11 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             timezone=os.getenv("TIMEZONE", "America/Los_Angeles").strip(),
             sqlite_path=(data_dir / "aika.db").resolve(),
-            gemini_max_calls_per_message=max(1, int(os.getenv("GEMINI_MAX_CALLS_PER_MESSAGE", "3"))),
+            gemini_max_calls_per_message=max(1, int(os.getenv("GEMINI_MAX_CALLS_PER_MESSAGE", "6"))),
+            gemini_max_tool_calls_per_message=max(
+                1,
+                int(os.getenv("GEMINI_MAX_TOOL_CALLS_PER_MESSAGE", "10")),
+            ),
             gemini_max_retries=max(1, int(os.getenv("GEMINI_MAX_RETRIES", "2"))),
             gemini_retry_base_delay_seconds=max(0.1, float(os.getenv("GEMINI_RETRY_BASE_DELAY_SECONDS", "1.0"))),
             gemini_quota_cooldown_seconds=max(1, int(os.getenv("GEMINI_QUOTA_COOLDOWN_SECONDS", "60"))),

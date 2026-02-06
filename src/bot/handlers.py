@@ -5,19 +5,18 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatAction
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.config import settings
 from src.db.session import get_session
 from src.memory.store import MemoryStore
-from src.tools.exec import run_admin_command
-from src.tools.files import FileService
-from src.tools.reminders import parse_reminder_time
+from src.support.error_triage import ErrorTriageService
+from src.support.solver import AdminSolveService
 from src.utils.paths import PathResolver
 
 
@@ -26,7 +25,8 @@ class BotServices:
     bot: Bot
     resolver: PathResolver
     orchestrator: AgentOrchestrator
-    schedule_reminder: Callable[[int, datetime], None]
+    error_triage: ErrorTriageService
+    solver: AdminSolveService
 
 
 MAX_INLINE_ATTACHMENT_BYTES = 5 * 1024 * 1024
@@ -58,6 +58,16 @@ def build_router(services: BotServices) -> Router:
         if message.text:
             await _handle_plain_text(message, user_id, services)
 
+    @router.callback_query()
+    async def callback_router(callback_query: CallbackQuery, is_admin: bool = False) -> None:
+        if not is_admin:
+            await callback_query.answer("Admin only.", show_alert=True)
+            return
+
+        handled = await services.solver.handle_callback(callback_query)
+        if not handled:
+            await callback_query.answer()
+
     return router
 
 
@@ -84,6 +94,7 @@ async def _handle_plain_text(message: Message, user_id: int, services: BotServic
     allow_shared = _explicit_shared_requested(text)
     result = await services.orchestrator.handle_user_text(
         telegram_user_id=user_id,
+        chat_id=message.chat.id,
         text=text,
         allow_shared=allow_shared,
         pending_attachment_note=pending_note,
@@ -162,6 +173,7 @@ async def _handle_attachment_message(message: Message, user_id: int, services: B
     allow_shared = _explicit_shared_requested(text_prompt)
     result = await services.orchestrator.handle_user_text(
         telegram_user_id=user_id,
+        chat_id=message.chat.id,
         text=text_prompt,
         allow_shared=allow_shared,
         pending_attachment_note=f"Attachment path: {cache_path}",
@@ -175,21 +187,6 @@ async def _handle_command(message: Message, user_id: int, is_admin: bool, servic
     parts = raw.split(maxsplit=1)
     cmd = parts[0].split("@")[0].lower()
     rest = parts[1].strip() if len(parts) > 1 else ""
-
-    if cmd == "/help":
-        await message.answer(
-            "Commands:\n"
-            "/help\n"
-            "/status\n"
-            "/run <shell command> (admin)\n"
-            "/files\n"
-            "/save <relative_cache_path> <dest_rel_path>\n"
-            "/shared put <rel_user_path> <rel_shared_path>\n"
-            "/shared get <rel_shared_path> <rel_user_path>\n"
-            "/remind <when> <text>\n"
-            "/remind_user <user_id> <when> <text>"
-        )
-        return
 
     if cmd == "/status":
         usage = services.resolver.user_disk_usage_bytes(user_id)
@@ -205,116 +202,69 @@ async def _handle_command(message: Message, user_id: int, is_admin: bool, servic
         )
         return
 
-    if cmd == "/run":
+    if cmd == "/problems":
+        if not is_admin:
+            await message.answer("Admin only.")
+            return
+        await _handle_problems_command(message, services)
+        return
+
+    if cmd == "/solve":
         if not is_admin:
             await message.answer("Admin only.")
             return
         if not rest:
-            await message.answer("Usage: /run <shell command>")
+            await message.answer("Usage: /solve <prompt>")
             return
-        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-        result = await run_admin_command(rest)
-        text = (
-            f"exit_code={result['exit_code']} timed_out={result['timed_out']}\n"
-            f"STDOUT:\n{result['stdout'] or '(empty)'}\n\n"
-            f"STDERR:\n{result['stderr'] or '(empty)'}"
+        await services.solver.start_manual_solve(
+            requester_user_id=user_id,
+            chat_id=message.chat.id,
+            prompt=rest,
         )
-        await _reply_chunked(message, text)
         return
 
-    if cmd == "/files":
-        async with get_session() as session:
-            store = MemoryStore(session)
-            file_service = FileService(services.resolver, store)
-            recent = await file_service.list_recent_user_files(user_id, limit=20)
-        if not recent:
-            await message.answer("No tracked files yet.")
-            return
-        lines = ["Recent files:"]
-        for item in recent:
-            lines.append(
-                f"- [{item['scope']}] {item['path']} ({item['kind']}, {item['status']}, exists={item['exists']})"
-            )
-        await _reply_chunked(message, "\n".join(lines))
+    await message.answer("Unknown command. Available: /status, /problems (admin), /solve (admin).")
+
+
+async def _handle_problems_command(message: Message, services: BotServices) -> None:
+    reports = services.error_triage.list_recent_reports(limit=20)
+    if not reports:
+        await message.answer("No error reports found.")
         return
 
-    if cmd == "/save":
-        args = rest.split(maxsplit=1)
-        if len(args) != 2:
-            await message.answer("Usage: /save <relative_cache_path> <dest_rel_path>")
-            return
-        src_rel, dst_rel = args
-        async with get_session() as session:
-            store = MemoryStore(session)
-            file_service = FileService(services.resolver, store)
-            result = await file_service.file_move(user_id, src_rel, dst_rel, location="user")
-        await message.answer(str(result))
-        return
+    lines = ["Latest error reports:"]
+    for report_path in reports:
+        preview = await asyncio.to_thread(_read_report_preview, report_path)
+        lines.append(f"- {report_path.name}: {preview}")
+    await _reply_chunked(message, "\n".join(lines))
 
-    if cmd == "/shared":
-        args = rest.split(maxsplit=2)
-        if len(args) != 3 or args[0] not in {"put", "get"}:
-            await message.answer("Usage: /shared put <rel_user_path> <rel_shared_path> or /shared get <rel_shared_path> <rel_user_path>")
-            return
-        mode, left, right = args
-        async with get_session() as session:
-            store = MemoryStore(session)
-            file_service = FileService(services.resolver, store)
-            if mode == "put":
-                result = await file_service.copy_user_to_shared(user_id, left, right)
-            else:
-                result = await file_service.copy_shared_to_user(user_id, left, right)
-        await message.answer(str(result))
-        return
 
-    if cmd == "/remind":
-        when_raw, reminder_text = _split_when_and_text(rest)
-        if not when_raw or not reminder_text:
-            await message.answer("Usage: /remind <when> <text>")
-            return
-        try:
-            run_at = parse_reminder_time(when_raw, settings.timezone)
-        except Exception as exc:
-            await message.answer(f"Invalid reminder time: {exc}")
-            return
-        async with get_session() as session:
-            store = MemoryStore(session)
-            reminder = await store.create_reminder(
-                creator_user_id=user_id,
-                target_user_id=user_id,
-                scheduled_for=run_at,
-                text=reminder_text,
-            )
-        services.schedule_reminder(reminder.id, run_at)
-        await message.answer(f"Reminder set for {run_at.isoformat()}")
-        return
+def _read_report_preview(report_path: Path) -> str:
+    try:
+        text = report_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return "Unable to read report."
 
-    if cmd == "/remind_user":
-        if not is_admin:
-            await message.answer("Admin only.")
-            return
-        target, when_raw, reminder_text = _split_remind_user_args(rest)
-        if target is None or not when_raw or not reminder_text:
-            await message.answer("Usage: /remind_user <user_id> <when> <text>")
-            return
-        try:
-            run_at = parse_reminder_time(when_raw, settings.timezone)
-        except Exception as exc:
-            await message.answer(f"Invalid reminder time: {exc}")
-            return
-        async with get_session() as session:
-            store = MemoryStore(session)
-            reminder = await store.create_reminder(
-                creator_user_id=user_id,
-                target_user_id=target,
-                scheduled_for=run_at,
-                text=reminder_text,
-            )
-        services.schedule_reminder(reminder.id, run_at)
-        await message.answer(f"Reminder for user {target} set for {run_at.isoformat()}")
-        return
+    context = _extract_md_section(text, "## Context")
+    triage = _extract_md_section(text, "## Groq Root Cause + Patch Suggestions")
+    context_line = _single_line(context) or "(no context)"
+    triage_line = _single_line(triage) or "(no triage)"
+    return f"context={context_line}; triage={triage_line}"
 
-    await message.answer("Unknown command. Use /help")
+
+def _extract_md_section(text: str, heading: str) -> str:
+    pattern = re.compile(rf"{re.escape(heading)}\n(.*?)(?:\n## |\Z)", flags=re.DOTALL)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _single_line(text: str, max_len: int = 180) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len] + "..."
 
 
 async def _reply_chunked(message: Message, text: str, chunk_size: int = 3800) -> None:
@@ -328,42 +278,6 @@ async def _reply_chunked(message: Message, text: str, chunk_size: int = 3800) ->
 
 def _explicit_shared_requested(text: str) -> bool:
     return bool(re.search(r"\bshared\b", text, flags=re.IGNORECASE))
-
-
-def _split_when_and_text(raw: str) -> tuple[str, str]:
-    value = raw.strip()
-    if not value:
-        return "", ""
-
-    if value.lower().startswith("in "):
-        parts = value.split(maxsplit=2)
-        if len(parts) < 3:
-            return "", ""
-        return f"{parts[0]} {parts[1]}", parts[2]
-
-    if value.lower().startswith("tomorrow"):
-        parts = value.split(maxsplit=2)
-        if len(parts) < 3:
-            return "", ""
-        return f"{parts[0]} {parts[1]}", parts[2]
-
-    parts = value.split(maxsplit=1)
-    if len(parts) < 2:
-        return "", ""
-    return parts[0], parts[1]
-
-
-def _split_remind_user_args(raw: str) -> tuple[Optional[int], str, str]:
-    parts = raw.split(maxsplit=1)
-    if len(parts) < 2:
-        return None, "", ""
-    try:
-        target = int(parts[0])
-    except ValueError:
-        return None, "", ""
-
-    when_raw, reminder_text = _split_when_and_text(parts[1])
-    return target, when_raw, reminder_text
 
 
 async def _load_pending_inline_media_bytes(pending_rows) -> list[tuple[bytes, str]]:

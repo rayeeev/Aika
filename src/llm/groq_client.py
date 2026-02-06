@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from groq import AsyncGroq
@@ -10,6 +13,20 @@ from src.config import GROQ_SUMMARY_MODEL, GROQ_TRIAGE_MODEL
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SolvePlanCommand:
+    cmd: str
+    reason: str
+
+
+@dataclass
+class SolvePlan:
+    analysis: str
+    commands: list[SolvePlanCommand]
+    expected_result: str
+    raw_text: str
 
 
 class GroqClient:
@@ -77,6 +94,27 @@ class GroqClient:
             max_tokens=800,
         )
 
+    async def build_solve_plan(self, prompt: str, context: Optional[str] = None) -> SolvePlan:
+        system = (
+            "You are a cautious Linux incident solver. "
+            "Return strict JSON only with keys: analysis (string), expected_result (string), "
+            "commands (array of objects with cmd and reason). "
+            "Commands must be concrete shell commands and ordered."
+        )
+        merged_context = (context or "").strip()
+        user_prompt = (
+            f"Task:\n{prompt.strip()}\n\n"
+            f"Context:\n{merged_context if merged_context else '(none)'}\n\n"
+            "Output JSON now."
+        )
+        text = await self._chat(
+            model=GROQ_TRIAGE_MODEL,
+            system_prompt=system,
+            user_prompt=user_prompt,
+            max_tokens=1200,
+        )
+        return _parse_solve_plan(text)
+
     async def _chat(
         self,
         model: str,
@@ -122,3 +160,71 @@ def _normalize_sentence_count(text: str, expected: int) -> str:
     else:
         used = parts + [parts[-1]] * (expected - len(parts))
     return ". ".join(used) + "."
+
+
+def _parse_solve_plan(raw_text: str) -> SolvePlan:
+    text = (raw_text or "").strip()
+    data = _safe_parse_json(text)
+    if not isinstance(data, dict):
+        return SolvePlan(
+            analysis=text or "No analysis returned.",
+            commands=[],
+            expected_result="",
+            raw_text=text,
+        )
+
+    analysis = str(data.get("analysis", "") or "").strip()
+    expected_result = str(data.get("expected_result", "") or "").strip()
+    commands_raw = data.get("commands")
+
+    commands: list[SolvePlanCommand] = []
+    if isinstance(commands_raw, list):
+        for item in commands_raw[:12]:
+            if isinstance(item, str):
+                cmd = item.strip()
+                reason = ""
+            elif isinstance(item, dict):
+                cmd = str(item.get("cmd", "") or "").strip()
+                reason = str(item.get("reason", "") or "").strip()
+            else:
+                continue
+
+            if not cmd:
+                continue
+            commands.append(SolvePlanCommand(cmd=cmd, reason=reason))
+
+    return SolvePlan(
+        analysis=analysis or "No analysis returned.",
+        commands=commands,
+        expected_result=expected_result,
+        raw_text=text,
+    )
+
+
+def _safe_parse_json(text: str) -> Optional[object]:
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        block = fenced_match.group(1).strip()
+        try:
+            return json.loads(block)
+        except Exception:
+            pass
+
+    left = candidate.find("{")
+    right = candidate.rfind("}")
+    if left == -1 or right == -1 or right <= left:
+        return None
+    body = candidate[left : right + 1]
+    try:
+        return json.loads(body)
+    except Exception:
+        return None

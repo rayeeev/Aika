@@ -130,10 +130,30 @@ class SandboxExecutor:
 
 
 async def run_admin_command(command: str, timeout_seconds: int = 20) -> dict[str, Any]:
+    return await _run_local_shell(command=command, timeout_seconds=timeout_seconds, cwd=None)
+
+
+async def run_root_command(command: str, timeout_seconds: int = 120) -> dict[str, Any]:
+    return await _run_local_shell(command=command, timeout_seconds=timeout_seconds, cwd="/")
+
+
+async def _run_local_shell(
+    command: str,
+    timeout_seconds: int,
+    cwd: Optional[str],
+) -> dict[str, Any]:
+    if not command.strip():
+        return {
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "Empty command",
+            "timed_out": False,
+        }
     process = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)

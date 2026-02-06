@@ -13,6 +13,8 @@ def _settings(tmp_path: Path) -> Settings:
         allowed_user_ids=[],
         admin_user_ids=[],
         gemini_api_key="",
+        gemini_api_key_fallbacks=[],
+        telegram_user_aliases={},
         groq_api_key="",
         data_dir=data_dir,
         user_dir=data_dir / "users",
@@ -25,6 +27,12 @@ def _settings(tmp_path: Path) -> Settings:
         log_level="INFO",
         timezone="UTC",
         sqlite_path=data_dir / "aika.db",
+        gemini_max_calls_per_message=6,
+        gemini_max_tool_calls_per_message=10,
+        gemini_max_retries=2,
+        gemini_retry_base_delay_seconds=1.0,
+        gemini_quota_cooldown_seconds=60,
+        gemini_daily_quota_cooldown_seconds=3600,
     )
 
 

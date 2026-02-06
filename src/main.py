@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import FSInputFile
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.bot.handlers import BotServices, build_router
@@ -16,6 +17,8 @@ from src.jobs.scheduler import SchedulerService
 from src.llm.gemini_client import GeminiClient
 from src.llm.groq_client import GroqClient
 from src.support.error_triage import ErrorTriageService
+from src.support.solver import AdminSolveService
+from src.tools.camera import CameraService
 from src.tools.exec import SandboxExecutor
 from src.utils.logging import configure_logging
 from src.utils.paths import PathResolver
@@ -43,12 +46,18 @@ async def run() -> None:
         daily_quota_cooldown_seconds=settings.gemini_daily_quota_cooldown_seconds,
     )
     sandbox_executor = SandboxExecutor(settings, resolver)
+    solve_service = AdminSolveService(
+        bot=bot,
+        groq=groq_client,
+        admin_user_ids=settings.admin_user_ids,
+    )
 
     error_triage = ErrorTriageService(
         resolver=resolver,
         groq=groq_client,
         bot=bot,
         admin_user_ids=settings.admin_user_ids,
+        auto_solver_callback=solve_service.handle_auto_problem,
     )
 
     maintenance_jobs = MaintenanceJobs(resolver=resolver, groq=groq_client)
@@ -58,23 +67,38 @@ async def run() -> None:
         error_triage=error_triage,
     )
 
+    camera_service = CameraService(resolver=resolver)
+
+    async def send_camera_photo(chat_id: int, file_path: str, caption: str) -> None:
+        photo = FSInputFile(file_path)
+        await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption or None)
+
     orchestrator = AgentOrchestrator(
         gemini=gemini_client,
         groq=groq_client,
         resolver=resolver,
         sandbox_executor=sandbox_executor,
         schedule_reminder_callback=scheduler_service.schedule_reminder,
+        camera_service=camera_service,
+        send_photo_callback=send_camera_photo,
     )
 
     services = BotServices(
         bot=bot,
         resolver=resolver,
         orchestrator=orchestrator,
-        schedule_reminder=scheduler_service.schedule_reminder,
+        error_triage=error_triage,
+        solver=solve_service,
     )
 
     router = build_router(services)
     router.message.middleware(
+        AllowedUserMiddleware(
+            allowed_user_ids=set(settings.allowed_user_ids),
+            admin_user_ids=set(settings.admin_user_ids),
+        )
+    )
+    router.callback_query.middleware(
         AllowedUserMiddleware(
             allowed_user_ids=set(settings.allowed_user_ids),
             admin_user_ids=set(settings.admin_user_ids),
@@ -110,7 +134,7 @@ async def run() -> None:
 
     logger.info("Starting Telegram long polling")
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await scheduler_service.shutdown()
         await bot.session.close()
