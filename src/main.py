@@ -29,14 +29,19 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")  # Comma-separated list
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SEND_STARTUP_MESSAGE = os.getenv("AIKA_STARTUP_MESSAGE", "true").lower() == "true"
 
-if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not GROQ_API_KEY:
-    logger.error("Missing TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, or GROQ_API_KEY")
+# Parse multiple Gemini API keys
+GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_RAW.split(",") if key.strip()]
+
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEYS or not GROQ_API_KEY:
+    logger.error("Missing TELEGRAM_BOT_TOKEN, GEMINI_API_KEYS, or GROQ_API_KEY")
     sys.exit(1)
+
+logger.info(f"Loaded {len(GEMINI_API_KEYS)} Gemini API key(s)")
 
 try:
     ALLOWED_USER_ID = int(ALLOWED_USER_ID)
@@ -61,8 +66,8 @@ memory.set_groq_client(groq_client)
 # Track scheduled wake-up jobs for potential cancellation
 scheduled_jobs: Dict[str, str] = {}  # job_id -> thought
 
-# Initialize Gemini Client
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize Gemini Clients for each API key
+gemini_clients: List[genai.Client] = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
 
 
 # --- Audio Transcription ---
@@ -265,23 +270,30 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
             parts=[genai_types.Part(text=msg["content"])]
         ))
 
-    chat = client.chats.create(
-        model="gemini-2.0-flash",
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=tools_list,
-            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=False),
-            temperature=0.8,  # More creative/personable
-        ),
-        history=chat_history
-    )
-
-    try:
-        response = chat.send_message(user_text)
-        return response.text
-    except Exception as e:
-        logger.error(f"Error calling Gemini: {e}")
-        return f"I tripped over a wire... ({e})"
+    # Try each API key until one works
+    last_error = None
+    for i, gemini_client in enumerate(gemini_clients):
+        try:
+            chat = gemini_client.chats.create(
+                model="gemini-2.0-flash",
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=tools_list,
+                    automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=False),
+                    temperature=0.8,  # More creative/personable
+                ),
+                history=chat_history
+            )
+            response = chat.send_message(user_text)
+            return response.text
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Gemini API key {i + 1}/{len(gemini_clients)} failed: {e}")
+            continue
+    
+    # All keys exhausted
+    logger.error(f"All {len(gemini_clients)} Gemini API keys exhausted. Last error: {last_error}")
+    return "All API keys are exhausted. Please try again later."
 
 
 async def process_user_input(message: Message, user_text: str, is_voice: bool = False):

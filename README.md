@@ -6,6 +6,7 @@ Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegra
 
 - **Autonomous Personality** - Sarcastic, sassy, and loyal. Not your typical assistant.
 - **Voice Message Support** - Transcribes voice messages using Groq Whisper (whisper-large-v3-turbo)
+- **API Key Rotation** - Supports multiple Gemini API keys with automatic failover
 - **Persistent Memory System**
   - Buffer: Last 5 interactions (10 messages)
   - Weekly Summary: Rolling compressed context
@@ -19,7 +20,7 @@ Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegra
 - Python 3.11+
 - Raspberry Pi 5 (or any Linux system)
 - Telegram Bot Token
-- Gemini API Key
+- Gemini API Key(s)
 - Groq API Key
 
 ## 🚀 Quick Start
@@ -51,7 +52,7 @@ Create a `.env` file in the project root:
 ```bash
 # Required
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-GEMINI_API_KEY=your_gemini_api_key
+GEMINI_API_KEYS=key1,key2,key3   # Comma-separated, tries each until one works
 GROQ_API_KEY=your_groq_api_key
 ALLOWED_USER_ID=your_telegram_user_id
 
@@ -59,6 +60,8 @@ ALLOWED_USER_ID=your_telegram_user_id
 AIKA_STARTUP_MESSAGE=true      # Set to 'false' to disable startup message
 AIKA_DB_PATH=/path/to/aika.db  # Custom database path (default: ./aika.db)
 ```
+
+> **💡 API Key Rotation**: You can provide multiple Gemini API keys separated by commas. If one key fails (rate limit, quota exceeded, etc.), Aika automatically tries the next one. If all keys fail, she'll respond with "All API keys are exhausted."
 
 #### Getting Your Telegram User ID
 
