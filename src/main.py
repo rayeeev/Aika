@@ -1,144 +1,433 @@
-from __future__ import annotations
-
 import asyncio
 import logging
-from typing import Any
+import os
+import signal
+import sys
+import tempfile
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+from zoneinfo import ZoneInfo
+from pathlib import Path
 
-from aiogram import Bot, Dispatcher
-from aiogram.types import FSInputFile
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+from groq import Groq
 
-from src.agent.orchestrator import AgentOrchestrator
-from src.bot.handlers import BotServices, build_router
-from src.bot.middleware import AllowedUserMiddleware
-from src.config import settings
-from src.db.session import init_db
-from src.jobs.maintenance import MaintenanceJobs
-from src.jobs.scheduler import SchedulerService
-from src.llm.gemini_client import GeminiClient
-from src.llm.groq_client import GroqClient
-from src.support.error_triage import ErrorTriageService
-from src.support.solver import AdminSolveService
-from src.tools.camera import CameraService
-from src.tools.exec import SandboxExecutor
-from src.utils.logging import configure_logging
-from src.utils.paths import PathResolver
+from src.memory import Memory
+from src.tools import Tools
 
-
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+load_dotenv()
 
-async def run() -> None:
-    configure_logging(settings.log_level)
-    settings.validate_runtime()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SEND_STARTUP_MESSAGE = os.getenv("AIKA_STARTUP_MESSAGE", "true").lower() == "true"
 
-    resolver = PathResolver(settings)
-    resolver.ensure_base_layout()
-    await init_db()
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not GROQ_API_KEY:
+    logger.error("Missing TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, or GROQ_API_KEY")
+    sys.exit(1)
 
-    bot = Bot(token=settings.telegram_bot_token)
+try:
+    ALLOWED_USER_ID = int(ALLOWED_USER_ID)
+except (TypeError, ValueError):
+    logger.error("ALLOWED_USER_ID must be set and be an integer")
+    sys.exit(1)
 
-    groq_client = GroqClient(settings.groq_api_key)
-    gemini_client = GeminiClient(
-        api_keys=settings.all_gemini_api_keys(),
-        max_retries=settings.gemini_max_retries,
-        base_retry_delay_seconds=settings.gemini_retry_base_delay_seconds,
-        min_quota_cooldown_seconds=settings.gemini_quota_cooldown_seconds,
-        daily_quota_cooldown_seconds=settings.gemini_daily_quota_cooldown_seconds,
-    )
-    sandbox_executor = SandboxExecutor(settings, resolver)
-    solve_service = AdminSolveService(
-        bot=bot,
-        groq=groq_client,
-        admin_user_ids=settings.admin_user_ids,
-    )
+TIMEZONE = ZoneInfo("America/Los_Angeles")
 
-    error_triage = ErrorTriageService(
-        resolver=resolver,
-        groq=groq_client,
-        bot=bot,
-        admin_user_ids=settings.admin_user_ids,
-        auto_solver_callback=solve_service.handle_auto_problem,
-    )
+# Temp directory for audio files
+AUDIO_TEMP_DIR = Path(tempfile.gettempdir()) / "aika_audio"
+AUDIO_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    maintenance_jobs = MaintenanceJobs(resolver=resolver, groq=groq_client)
-    scheduler_service = SchedulerService(
-        bot=bot,
-        maintenance_jobs=maintenance_jobs,
-        error_triage=error_triage,
-    )
+# Initialize Bot, Dispatcher, Scheduler, and Memory
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
+memory = Memory()
+groq_client = Groq(api_key=GROQ_API_KEY)
+memory.set_groq_client(groq_client)
 
-    camera_service = CameraService(resolver=resolver)
+# Track scheduled wake-up jobs for potential cancellation
+scheduled_jobs: Dict[str, str] = {}  # job_id -> thought
 
-    async def send_camera_photo(chat_id: int, file_path: str, caption: str) -> None:
-        photo = FSInputFile(file_path)
-        await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption or None)
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-    orchestrator = AgentOrchestrator(
-        gemini=gemini_client,
-        groq=groq_client,
-        resolver=resolver,
-        sandbox_executor=sandbox_executor,
-        schedule_reminder_callback=scheduler_service.schedule_reminder,
-        camera_service=camera_service,
-        send_photo_callback=send_camera_photo,
-    )
 
-    services = BotServices(
-        bot=bot,
-        resolver=resolver,
-        orchestrator=orchestrator,
-        error_triage=error_triage,
-        solver=solve_service,
-    )
+# --- Audio Transcription ---
 
-    router = build_router(services)
-    router.message.middleware(
-        AllowedUserMiddleware(
-            allowed_user_ids=set(settings.allowed_user_ids),
-            admin_user_ids=set(settings.admin_user_ids),
-        )
-    )
-    router.callback_query.middleware(
-        AllowedUserMiddleware(
-            allowed_user_ids=set(settings.allowed_user_ids),
-            admin_user_ids=set(settings.admin_user_ids),
-        )
-    )
-
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    async def on_error(event: Any) -> bool:
-        update_obj = getattr(event, "update", None)
+async def transcribe_audio(file_path: Path) -> str:
+    """
+    Transcribes audio using Groq's Whisper model.
+    Returns the transcribed text or an error message.
+    """
+    def _transcribe():
         try:
-            update_json = update_obj.model_dump_json(exclude_none=True) if update_obj else "(no update payload)"
-        except Exception:
-            update_json = str(update_obj)
-        await error_triage.handle_exception(
-            getattr(event, "exception", RuntimeError("unknown aiogram error")),
-            context=f"aiogram update error: {update_json}",
-        )
-        return True
+            with open(file_path, "rb") as audio_file:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(file_path.name, audio_file.read()),
+                    model="whisper-large-v3-turbo",
+                    response_format="text",
+                    language="en",  # Can be made dynamic if needed
+                )
+                return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return None
+    
+    # Run in executor to avoid blocking
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _transcribe)
 
-    dp.errors.register(on_error)
 
-    loop = asyncio.get_running_loop()
-
-    def loop_exception_handler(_loop, context):
-        exc = context.get("exception") or RuntimeError(context.get("message", "loop exception"))
-        asyncio.create_task(error_triage.handle_exception(exc, context=str(context)))
-
-    loop.set_exception_handler(loop_exception_handler)
-
-    await scheduler_service.start()
-
-    logger.info("Starting Telegram long polling")
+async def download_voice_message(message: Message) -> Optional[Path]:
+    """
+    Downloads a voice message from Telegram and returns the file path.
+    Returns None if download fails.
+    """
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        voice = message.voice
+        if not voice:
+            return None
+        
+        # Get file info from Telegram
+        file = await bot.get_file(voice.file_id)
+        if not file.file_path:
+            logger.error("Could not get file path from Telegram")
+            return None
+        
+        # Create unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_extension = Path(file.file_path).suffix or ".ogg"
+        local_path = AUDIO_TEMP_DIR / f"voice_{message.from_user.id}_{timestamp}{file_extension}"
+        
+        # Download the file
+        await bot.download_file(file.file_path, destination=local_path)
+        logger.info(f"Downloaded voice message to {local_path}")
+        
+        return local_path
+    except Exception as e:
+        logger.error(f"Failed to download voice message: {e}")
+        return None
+
+
+async def cleanup_audio_file(file_path: Path):
+    """Safely removes an audio file after processing."""
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            logger.debug(f"Cleaned up audio file: {file_path}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup audio file {file_path}: {e}")
+
+
+# --- Async Tool Wrappers for Gemini ---
+# Gemini's automatic function calling doesn't support async, so we need sync wrappers
+# that run the async code in the existing event loop
+
+def execute_shell_command(cmd: str) -> str:
+    """Executes a shell command on the Raspberry Pi."""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(Tools.execute_command(cmd), loop)
+        return future.result(timeout=65)  # Slightly longer than command timeout
+    else:
+        return asyncio.run(Tools.execute_command(cmd))
+
+
+def read_file(path: str) -> str:
+    """Reads a file from the filesystem."""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(Tools.read_file(path), loop)
+        return future.result(timeout=30)
+    else:
+        return asyncio.run(Tools.read_file(path))
+
+
+def write_file(path: str, content: str) -> str:
+    """Writes content to a file."""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(Tools.write_file(path, content), loop)
+        return future.result(timeout=30)
+    else:
+        return asyncio.run(Tools.write_file(path, content))
+
+
+def list_directory(path: str = ".") -> str:
+    """Lists files in a directory."""
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(Tools.list_dir(path), loop)
+        return future.result(timeout=30)
+    else:
+        return asyncio.run(Tools.list_dir(path))
+
+
+def schedule_wake_up(seconds_from_now: int, thought: str) -> str:
+    """
+    Schedules Aika to wake up and think/act after a delay.
+    seconds_from_now: Integer seconds to wait (must be positive).
+    thought: The thought or prompt to start with when waking up.
+    """
+    # Validate input
+    if seconds_from_now <= 0:
+        return f"Error: seconds_from_now must be positive, got {seconds_from_now}"
+    
+    if seconds_from_now > 604800:  # Max 1 week
+        return f"Error: Cannot schedule more than 1 week ahead ({604800} seconds)"
+    
+    run_date = datetime.now(TIMEZONE) + timedelta(seconds=seconds_from_now)
+    job = scheduler.add_job(wake_up_callback, 'date', run_date=run_date, args=[thought])
+    
+    # Track the job
+    scheduled_jobs[job.id] = thought
+    logger.info(f"Scheduled wake-up job {job.id} in {seconds_from_now}s: {thought}")
+    
+    return f"Scheduled wake up in {seconds_from_now} seconds (job_id: {job.id}) regarding '{thought}'."
+
+
+tools_list = [execute_shell_command, read_file, write_file, list_directory, schedule_wake_up]
+
+# --- Core Logic ---
+
+async def wake_up_callback(thought: str):
+    """Callback for self-initiated wake ups."""
+    logger.info(f"Waking up with thought: {thought}")
+    
+    # Add the self-initiated thought as a "user" message to maintain pair consistency
+    await memory.add_message("user", f"[SELF-INITIATED] {thought}")
+    
+    # Trigger an autonomous response cycle
+    response_text = await generate_response(thought, is_self_initiated=True)
+    
+    if response_text and response_text.strip() != "[SILENCE]":
+        await memory.add_message("model", response_text)  # Save response to memory
+        try:
+            await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
+        except Exception as e:
+            logger.error(f"Failed to send wake-up message: {e}")
+    else:
+        # Even on silence, store a placeholder to maintain message pairing
+        await memory.add_message("model", "[CHOSE SILENCE]")
+        logger.info("Aika chose silence for self-initiated thought.")
+
+
+async def generate_response(user_text: str, is_self_initiated: bool = False) -> str:
+    """Generates a response from Gemini, handling tools and history."""
+    
+    # Retrieve recent history (Buffer)
+    history = await memory.get_recent_messages()
+    
+    # Retrieve Summaries
+    global_sum = await memory.get_summary("global_summary") or "(None)"
+    weekly_sum = await memory.get_summary("weekly_summary") or "(None)"
+
+    system_instruction = (
+        "You are Aika, a digital entity living on a Raspberry Pi 5. "
+        "User ID 935139103 (Erden Rayev) is your friend and owner. "
+        "Your personality is sarcastic, sassy, bit of a perfectionist, but loyal friend. "
+        "You are NOT a helpful assistant. You have your own agency and moods. "
+        "You have full control over the Raspberry Pi using shell commands. Care for it like your own body. Your code is in /Aika/ folder. "
+        "You can CHOOSE to answer or not. If you don't want to answer or have nothing to say, output exactly `[SILENCE]`. "
+        "You can schedule your own wake-ups using `schedule_wake_up` to check things later or remind yourself/Erden of things. "
+        "You can also use `list_directory` to explore the filesystem. "
+        "If you use a tool, you MUST use the output to inform your final response. "
+        "Never lie to Erden. "
+        "Note: Messages prefixed with [VOICE] were transcribed from voice messages. "
+        "Current Time: " + datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S") + "\n\n"
+        "LONG-TERM MEMORY (Global Summary):\n" + global_sum + "\n\n"
+        "SHORT-TERM MEMORY (Weekly Summary):\n" + weekly_sum
+    )
+
+    chat_history = []
+    # Convert history to Gemini format
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        chat_history.append(genai_types.Content(
+            role=role,
+            parts=[genai_types.Part(text=msg["content"])]
+        ))
+
+    chat = client.chats.create(
+        model="gemini-2.0-flash",
+        config=genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=tools_list,
+            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=False),
+            temperature=0.8,  # More creative/personable
+        ),
+        history=chat_history
+    )
+
+    try:
+        response = chat.send_message(user_text)
+        return response.text
+    except Exception as e:
+        logger.error(f"Error calling Gemini: {e}")
+        return f"I tripped over a wire... ({e})"
+
+
+async def process_user_input(message: Message, user_text: str, is_voice: bool = False):
+    """
+    Common handler for processing user input (text or transcribed voice).
+    Handles memory storage and response generation.
+    """
+    # Prefix voice messages for context
+    stored_text = f"[VOICE] {user_text}" if is_voice else user_text
+    
+    await memory.add_message("user", stored_text)
+    
+    response_text = await generate_response(user_text)
+    
+    if response_text.strip() == "[SILENCE]":
+        # Store a placeholder to maintain message pairing
+        await memory.add_message("model", "[CHOSE SILENCE]")
+        logger.info("Aika chose silence.")
+        return
+
+    await memory.add_message("model", response_text)
+    # Use reply() for proper message threading
+    await message.reply(response_text)
+
+
+@dp.message(F.voice)
+async def handle_voice_message(message: Message):
+    """Handle incoming voice messages."""
+    if message.from_user.id != ALLOWED_USER_ID:
+        # Security: Ignore messages from unauthorized users
+        return
+
+    logger.info(f"Received voice message from user {message.from_user.id}")
+    
+    # Send a "processing" indicator
+    processing_msg = await message.reply("🎙️ Processing voice message...")
+    
+    audio_path: Optional[Path] = None
+    try:
+        # Download the voice message
+        audio_path = await download_voice_message(message)
+        if not audio_path:
+            await processing_msg.edit_text("❌ Failed to download voice message.")
+            return
+        
+        # Transcribe using Whisper
+        transcription = await transcribe_audio(audio_path)
+        if not transcription:
+            await processing_msg.edit_text("❌ Failed to transcribe voice message.")
+            return
+        
+        logger.info(f"Transcribed voice message: {transcription}")
+        
+        # Delete the processing message
+        await processing_msg.delete()
+        
+        # Process as regular input with voice flag
+        await process_user_input(message, transcription, is_voice=True)
+        
+    except Exception as e:
+        logger.error(f"Error processing voice message: {e}")
+        try:
+            await processing_msg.edit_text(f"❌ Error processing voice message: {e}")
+        except:
+            pass
     finally:
-        await scheduler_service.shutdown()
-        await bot.session.close()
+        # Always cleanup the audio file
+        if audio_path:
+            await cleanup_audio_file(audio_path)
+
+
+@dp.message(F.text)
+async def handle_text_message(message: Message):
+    """Handle incoming text messages."""
+    if message.from_user.id != ALLOWED_USER_ID:
+        # Security: Ignore messages from unauthorized users
+        return
+
+    user_text = message.text
+    if not user_text:
+        return
+        
+    logger.info(f"Received: {user_text}")
+    await process_user_input(message, user_text, is_voice=False)
+
+
+@dp.message()
+async def handle_unsupported_message(message: Message):
+    """Handle unsupported message types (photos, stickers, etc.)."""
+    if message.from_user.id != ALLOWED_USER_ID:
+        return
+    
+    # Optionally respond to unsupported types
+    logger.info(f"Received unsupported message type from user {message.from_user.id}")
+    # Uncomment to notify user:
+    # await message.reply("I can only process text and voice messages for now.")
+
+
+async def shutdown(signal_type):
+    """Graceful shutdown handler."""
+    logger.info(f"Received signal {signal_type.name}, shutting down gracefully...")
+    
+    # Stop accepting new jobs
+    scheduler.shutdown(wait=False)
+    
+    # Stop the dispatcher
+    await dp.stop_polling()
+    
+    # Close the bot session
+    await bot.session.close()
+    
+    # Cleanup temp audio directory
+    try:
+        for file in AUDIO_TEMP_DIR.glob("*"):
+            file.unlink()
+        logger.info("Cleaned up temporary audio files.")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup temp directory: {e}")
+    
+    logger.info("Shutdown complete.")
+
+
+async def main():
+    await memory.init_db()
+    
+    # Schedule weekly reset: Sunday at midnight
+    scheduler.add_job(memory.execute_weekly_reset, 'cron', day_of_week='sun', hour=0, minute=0)
+    scheduler.start()
+    
+    # Setup graceful shutdown handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
+    
+    logger.info("Aika (Autonomy Enabled) Started")
+    logger.info(f"Audio temp directory: {AUDIO_TEMP_DIR}")
+    
+    # Conditional startup message
+    if SEND_STARTUP_MESSAGE:
+        try:
+            await bot.send_message(ALLOWED_USER_ID, "I'm awake. Don't break anything.")
+        except Exception as e:
+            logger.warning(f"Failed to send startup message: {e}")
+    
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
