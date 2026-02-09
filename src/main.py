@@ -72,23 +72,29 @@ gemini_clients: List[genai.Client] = [genai.Client(api_key=key) for key in GEMIN
 
 # --- Audio Transcription ---
 
-async def transcribe_audio(file_path: Path) -> str:
+async def transcribe_audio(file_path: Path) -> Optional[str]:
     """
     Transcribes audio using Groq's Whisper model.
-    Returns the transcribed text or an error message.
+    Returns the transcribed text or None on error.
     """
     def _transcribe():
         try:
             with open(file_path, "rb") as audio_file:
                 transcription = groq_client.audio.transcriptions.create(
-                    file=(file_path.name, audio_file.read()),
+                    file=audio_file,
                     model="whisper-large-v3-turbo",
                     response_format="text",
-                    language="en",  # Can be made dynamic if needed
                 )
-                return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+                # Handle both string and object responses
+                if isinstance(transcription, str):
+                    return transcription.strip()
+                elif hasattr(transcription, 'text'):
+                    return transcription.text.strip()
+                else:
+                    logger.error(f"Unexpected transcription response type: {type(transcription)}")
+                    return None
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
+            logger.error(f"Transcription error: {e}", exc_info=True)
             return None
     
     # Run in executor to avoid blocking
