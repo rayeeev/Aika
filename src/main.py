@@ -275,7 +275,7 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
     for i, gemini_client in enumerate(gemini_clients):
         try:
             chat = gemini_client.chats.create(
-                model="gemini-2.0-flash",
+                model="gemini-3-flash-preview",
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     tools=tools_list,
