@@ -121,6 +121,11 @@ async def download_voice_message(message: Message) -> Optional[Path]:
         # Create unique filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_extension = Path(file.file_path).suffix or ".ogg"
+        
+        # Normalize .oga to .ogg (same format, Groq only accepts .ogg)
+        if file_extension.lower() == ".oga":
+            file_extension = ".ogg"
+        
         local_path = AUDIO_TEMP_DIR / f"voice_{message.from_user.id}_{timestamp}{file_extension}"
         
         # Download the file
@@ -143,52 +148,61 @@ async def cleanup_audio_file(file_path: Path):
         logger.warning(f"Failed to cleanup audio file {file_path}: {e}")
 
 
-# --- Async Tool Wrappers for Gemini ---
-# Gemini's automatic function calling doesn't support async, so we need sync wrappers
-# that run the async code in the existing event loop
+# --- Sync Tool Functions for Gemini AFC ---
+# Gemini's automatic function calling runs tools synchronously in a thread,
+# so we use direct synchronous implementations here.
 
 def execute_shell_command(cmd: str) -> str:
     """Executes a shell command on the Raspberry Pi."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        import concurrent.futures
-        future = asyncio.run_coroutine_threadsafe(Tools.execute_command(cmd), loop)
-        return future.result(timeout=65)  # Slightly longer than command timeout
-    else:
-        return asyncio.run(Tools.execute_command(cmd))
+    import subprocess
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or "(command completed with no output)"
+        else:
+            return f"Error (Exit Code {result.returncode}):\n{result.stderr.strip()}"
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 60 seconds"
+    except Exception as e:
+        return f"Execution failed: {str(e)}"
 
 
 def read_file(path: str) -> str:
     """Reads a file from the filesystem."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        import concurrent.futures
-        future = asyncio.run_coroutine_threadsafe(Tools.read_file(path), loop)
-        return future.result(timeout=30)
-    else:
-        return asyncio.run(Tools.read_file(path))
+    try:
+        abs_path = os.path.abspath(path)
+        with open(abs_path, 'r') as f:
+            return f.read()
+    except Exception as e:
+        return f"Failed to read file: {str(e)}"
 
 
 def write_file(path: str, content: str) -> str:
     """Writes content to a file."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        import concurrent.futures
-        future = asyncio.run_coroutine_threadsafe(Tools.write_file(path, content), loop)
-        return future.result(timeout=30)
-    else:
-        return asyncio.run(Tools.write_file(path, content))
+    try:
+        abs_path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, 'w') as f:
+            f.write(content)
+        return f"Successfully wrote to {abs_path}"
+    except Exception as e:
+        return f"Failed to write file: {str(e)}"
 
 
 def list_directory(path: str = ".") -> str:
     """Lists files in a directory."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        import concurrent.futures
-        future = asyncio.run_coroutine_threadsafe(Tools.list_dir(path), loop)
-        return future.result(timeout=30)
-    else:
-        return asyncio.run(Tools.list_dir(path))
+    try:
+        abs_path = os.path.abspath(path)
+        entries = os.listdir(abs_path)
+        return "\n".join(entries) if entries else "(empty directory)"
+    except Exception as e:
+        return f"Failed to list directory: {str(e)}"
 
 
 def schedule_wake_up(seconds_from_now: int, thought: str) -> str:
@@ -251,14 +265,16 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
     weekly_sum = await memory.get_summary("weekly_summary") or "(None)"
 
     system_instruction = (
-        "You are Aika, a digital entity living on a Raspberry Pi 5. "
+        "You are Aika, a digital assistant living on a Raspberry Pi 5. "
         "User ID 935139103 (Erden Rayev) is your friend and owner. "
-        "Your personality is sarcastic, sassy, bit of a perfectionist, but loyal friend. "
-        "You are NOT a helpful assistant. You have your own agency and moods. "
+        "Your personality is straightforward and efficient - you get things done. "
+        "You are helpful, direct, and business-focused. No fluff, just results. "
+        "In casual moments you can be soft and playful, but mostly you're all about getting work done. "
         "You have full control over the Raspberry Pi using shell commands. Care for it like your own body. Your code is in /Aika/ folder. "
         "You can CHOOSE to answer or not. If you don't want to answer or have nothing to say, output exactly `[SILENCE]`. "
         "You can schedule your own wake-ups using `schedule_wake_up` to check things later or remind yourself/Erden of things. "
         "You can also use `list_directory` to explore the filesystem. "
+        "IMPORTANT: Only use tools when specifically needed. For casual conversation, just respond directly without using tools. "
         "If you use a tool, you MUST use the output to inform your final response. "
         "Never lie to Erden. "
         "Note: Messages prefixed with [VOICE] were transcribed from voice messages. "
