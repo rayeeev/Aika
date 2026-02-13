@@ -4,14 +4,15 @@ Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegra
 
 ## ✨ Features
 
-- **Autonomous Personality** - Sarcastic, sassy, and loyal. Not your typical assistant.
+- **Autonomous Personality** - Straightforward, efficient, and loyal
 - **Voice Message Support** - Transcribes voice messages using Groq Whisper (whisper-large-v3-turbo)
 - **API Key Rotation** - Supports multiple Gemini API keys with automatic failover
 - **Persistent Memory System**
-  - Buffer: Last 5 interactions (10 messages)
+  - Buffer: Last 5 interactions (10 messages), auto-expires after 1 hour of inactivity
   - Weekly Summary: Rolling compressed context
   - Global Summary: Long-term core memories
-- **Tool Use** - Shell commands, file read/write, directory listing
+- **Time-Gap Awareness** - Understands conversation breaks (night → morning = new conversation)
+- **Tool Use** - Shell commands, file read/write, directory listing, server log access
 - **Self-Scheduling** - Can schedule wake-ups to remind or check on things
 - **Graceful Shutdown** - Proper cleanup on SIGINT/SIGTERM
 
@@ -61,7 +62,7 @@ AIKA_STARTUP_MESSAGE=true      # Set to 'false' to disable startup message
 AIKA_DB_PATH=/path/to/aika.db  # Custom database path (default: ./aika.db)
 ```
 
-> **💡 API Key Rotation**: You can provide multiple Gemini API keys separated by commas. If one key fails (rate limit, quota exceeded, etc.), Aika automatically tries the next one. If all keys fail, she'll respond with "All API keys are exhausted."
+> **💡 API Key Rotation**: You can provide multiple Gemini API keys separated by commas. If one key fails (rate limit, quota exceeded, etc.), Aika automatically tries the next one.
 
 #### Getting Your Telegram User ID
 
@@ -83,7 +84,6 @@ python -m src.main
 Or for production with auto-restart:
 
 ```bash
-# Using systemd (recommended for Raspberry Pi)
 sudo nano /etc/systemd/system/aika.service
 ```
 
@@ -120,19 +120,19 @@ sudo systemctl start aika
 ```
 Aika/
 ├── src/
-│   ├── main.py      # Bot entry point, message handling, tools
-│   ├── memory.py    # Memory management (buffer, summaries, DB)
-│   └── tools.py     # System tools (shell, file I/O)
+│   ├── main.py      # Bot entry point, message handling, tools, LLM orchestration
+│   └── memory.py    # Memory management (buffer, summaries, time-based expiry)
 ├── .env             # Environment variables (create this)
 ├── .gitignore
 ├── requirements.txt
 ├── aika.db          # SQLite database (auto-created)
+├── aika.log         # Server logs (auto-created, rotated at 512KB)
 └── README.md
 ```
 
 ## 🧠 Memory Architecture
 
-Aika uses a three-tier memory system:
+Aika uses a three-tier memory system with time-based expiry:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -146,21 +146,23 @@ Aika uses a three-tier memory system:
 ┌─────────────────────────────────────────────────────┐
 │                   WEEKLY SUMMARY                     │
 │       (3 sentences, resets weekly)                   │
-│       Updated when buffer overflows                  │
+│       Updated on buffer overflow OR time expiry      │
 └─────────────────────────────────────────────────────┘
                          ▲
                          │ Overflow (>10 messages)
+                         │ OR messages >1 hour old
                          │
 ┌─────────────────────────────────────────────────────┐
 │               IMMEDIATE BUFFER                       │
 │         (Last 10 messages / 5 interactions)          │
-│         Raw transcript, oldest popped first          │
+│         Auto-expires after 1 hour of inactivity      │
+│         Oldest popped first on overflow              │
 └─────────────────────────────────────────────────────┘
 ```
 
-## 🔧 Available Tools
+**Time-gap awareness**: Messages separated by >30 minutes get `[TIME GAP]` markers in the chat history, helping Aika treat overnight or long gaps as separate conversations.
 
-Aika can use these tools during conversations:
+## 🔧 Available Tools
 
 | Tool | Description |
 |------|-------------|
@@ -169,13 +171,12 @@ Aika can use these tools during conversations:
 | `write_file(path, content)` | Write content to a file |
 | `list_directory(path)` | List directory contents |
 | `schedule_wake_up(seconds, thought)` | Schedule a self-initiated check-in |
+| `read_server_logs(lines)` | Read Aika's own server logs (last N lines) |
 
 ## 🎙️ Voice Messages
 
-Aika supports voice messages:
-
 1. Send a voice message to the bot
-2. It's transcribed using Groq's Whisper (whisper-large-v3-turbo)
+2. Transcribed using Groq's Whisper (whisper-large-v3-turbo)
 3. Stored in memory with `[VOICE]` prefix
 4. Processed like regular text
 
@@ -194,8 +195,10 @@ Check logs:
 # If running with systemd
 sudo journalctl -u aika -f
 
-# If running directly
-# Logs output to stdout
+# Aika's own log file (also readable by Aika via read_server_logs tool)
+tail -f aika.log
+
+# If running directly, logs output to stdout
 ```
 
 Check database:
