@@ -17,6 +17,7 @@ DB_PATH = os.getenv("AIKA_DB_PATH", os.path.join(os.path.dirname(os.path.dirname
 BUFFER_MAX_MESSAGES = 20
 BUFFER_EXPIRY_SECONDS = 3600  # 1 hour
 MAX_RETRIEVED_MEMORIES = 10
+MAX_MEMORY_CONTEXT_CHARS = 4000  # Character budget for recalled memory cards
 DECAY_NODE_HALFLIFE = 0.995   # per hour
 DECAY_EDGE_HALFLIFE = 0.99    # per hour (edges decay faster)
 DEAD_EDGE_THRESHOLD = 0.01
@@ -173,12 +174,19 @@ class Memory:
                 model=self.model_name,
                 temperature=0.3,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+
+            # Strip <think>...</think> blocks (qwen3 thinking mode)
+            raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
 
             # Strip markdown code fences if present
             if raw.startswith("```"):
                 raw = re.sub(r'^```(?:json)?\s*', '', raw)
                 raw = re.sub(r'\s*```$', '', raw)
+
+            if not raw:
+                return
 
             memories = json.loads(raw)
             if not isinstance(memories, list):
@@ -374,6 +382,7 @@ class Memory:
             return "(No memories recalled)"
 
         cards = []
+        total_chars = 0
         for score, node_id, mem_type, title, content, strength, last_accessed in top:
             hours_ago = (now - last_accessed) / 3600
             if hours_ago < 1:
@@ -384,11 +393,17 @@ class Memory:
                 time_str = f"{int(hours_ago / 24)}d ago"
 
             emoji = {"semantic": "💡", "episodic": "📅", "procedural": "⚙️"}.get(mem_type, "📌")
-            cards.append(
+            card = (
                 f"{emoji} [{mem_type.upper()}] {title}\n"
                 f"   {content}\n"
                 f"   strength: {strength:.1f} | last: {time_str}"
             )
+            # Enforce character budget — stop adding cards if over limit
+            if total_chars + len(card) > MAX_MEMORY_CONTEXT_CHARS and cards:
+                logger.info(f"Memory context budget reached ({total_chars} chars, {len(cards)} cards). Skipping remaining.")
+                break
+            cards.append(card)
+            total_chars += len(card) + 2  # +2 for "\n\n" join separator
 
         return "\n\n".join(cards)
 
@@ -483,10 +498,14 @@ class Memory:
                 model=self.model_name,
                 temperature=0.2,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+            raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
             if raw.startswith("```"):
                 raw = re.sub(r'^```(?:json)?\s*', '', raw)
                 raw = re.sub(r'\s*```$', '', raw)
+            if not raw:
+                return
 
             actions = json.loads(raw)
             if not isinstance(actions, list):

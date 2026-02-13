@@ -1,20 +1,59 @@
 # 🤖 Aika - Autonomous AI Agent
 
-Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegram. She has her own personality, memory system, and can execute commands on the host system.
+Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegram. She has full system control, a brain-inspired memory system, and her own personality.
 
 ## ✨ Features
 
-- **Autonomous Personality** - Straightforward, efficient, and loyal
-- **Voice Message Support** - Transcribes voice messages using Groq Whisper (whisper-large-v3-turbo)
-- **API Key Rotation** - Supports multiple Gemini API keys with automatic failover
-- **Persistent Memory System**
-  - Buffer: Last 5 interactions (10 messages), auto-expires after 1 hour of inactivity
-  - Weekly Summary: Rolling compressed context
-  - Global Summary: Long-term core memories
-- **Time-Gap Awareness** - Understands conversation breaks (night → morning = new conversation)
-- **Tool Use** - Shell commands, file read/write, directory listing, server log access
-- **Self-Scheduling** - Can schedule wake-ups to remind or check on things
-- **Graceful Shutdown** - Proper cleanup on SIGINT/SIGTERM
+- **Brain-Inspired Memory** — Structured memory nodes (semantic/episodic/procedural) with cue-based retrieval, association edges, strength decay, and nightly consolidation
+- **Voice Message Support** — Transcribes voice via Groq Whisper (whisper-large-v3-turbo)
+- **API Key Rotation** — Multiple Gemini keys with automatic failover
+- **Time-Gap Awareness** — Understands conversation breaks naturally
+- **Tool Use** — Shell commands, file I/O, directory listing, server log access
+- **Self-Scheduling** — Can schedule wake-ups to remind or check on things
+- **Graceful Shutdown** — Clean resource cleanup on SIGINT/SIGTERM
+
+## 🧠 Memory Architecture
+
+Aika uses a **brain-inspired memory system** — not flat summaries, but structured knowledge nodes with associative recall.
+
+```
+┌─────────────────────────────────────────────────────┐
+│              CONTEXT COMPOSER                        │
+│         (Budget-aware prompt assembly)               │
+│                                                     │
+│    Working Set (last 20 messages)                    │
+│    + Recalled Memory Cards (cue-matched, ranked)    │
+└──────────────┬──────────────────────────────────────┘
+               │ retrieves from
+               ▼
+┌─────────────────────────────────────────────────────┐
+│              MEMORY NODES                            │
+│                                                     │
+│  💡 Semantic  — stable facts, preferences, bio      │
+│  📅 Episodic  — notable events, decisions, moments  │
+│  ⚙️ Procedural — behavioral patterns, tool habits   │
+│                                                     │
+│  Each node has: strength, access count, timestamps  │
+│  Strength decays over time, reinforced on recall    │
+└──────────────┬──────────────────────────────────────┘
+               │ linked by
+               ▼
+┌─────────────────────────────────────────────────────┐
+│           ASSOCIATION EDGES + CUE INDEX              │
+│                                                     │
+│  Keyword/entity cues for fast retrieval             │
+│  Weighted edges between related memories            │
+│  Spreading activation (1-hop) for "scent → story"   │
+│  Edges decay faster than nodes                      │
+└─────────────────────────────────────────────────────┘
+```
+
+### How It Works
+
+1. **Ingest** — After each turn, Groq extracts structured memories as JSON (facts, events, patterns). Deduplicates by cue overlap. Creates association edges between related nodes.
+2. **Retrieve** — Before each Gemini call, keywords from the user's message are matched against the cue index. Top candidates + 1-hop neighbors are scored and ranked. Top 10 are formatted as memory cards in the prompt.
+3. **Decay** — Node strength decays based on time since last access (high-access nodes decay slower). Edges decay faster. Dead edges are pruned. Dead nodes are archived.
+4. **Consolidation** — Nightly at 4 AM, Groq reviews weak memories and decides: keep, archive, or delete.
 
 ## 📋 Requirements
 
@@ -26,7 +65,7 @@ Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegra
 
 ## 🚀 Quick Start
 
-### 1. Clone the Repository
+### 1. Clone & Setup
 
 ```bash
 git clone <your-repo-url>
@@ -120,65 +159,25 @@ sudo systemctl start aika
 ```
 Aika/
 ├── src/
-│   ├── main.py      # Bot entry point, message handling, tools, LLM orchestration
-│   └── memory.py    # Memory management (buffer, summaries, time-based expiry)
-├── .env             # Environment variables (create this)
-├── .gitignore
+│   ├── main.py      # Bot, message handling, tools, LLM orchestration
+│   └── memory.py    # Memory nodes, cue retrieval, decay, consolidation
+├── .env
 ├── requirements.txt
-├── aika.db          # SQLite database (auto-created)
-├── aika.log         # Server logs (auto-created, rotated at 512KB)
+├── aika.db          # SQLite (auto-created)
+├── aika.log         # Server logs (cleared on restart)
 └── README.md
 ```
 
-## 🧠 Memory Architecture
-
-Aika uses a three-tier memory system with time-based expiry:
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   GLOBAL SUMMARY                     │
-│         (4 sentences, persists forever)              │
-│         Updated weekly from weekly summary           │
-└─────────────────────────────────────────────────────┘
-                         ▲
-                         │ Weekly Reset (Sunday midnight)
-                         │
-┌─────────────────────────────────────────────────────┐
-│                   WEEKLY SUMMARY                     │
-│       (3 sentences, resets weekly)                   │
-│       Updated on buffer overflow OR time expiry      │
-└─────────────────────────────────────────────────────┘
-                         ▲
-                         │ Overflow (>10 messages)
-                         │ OR messages >1 hour old
-                         │
-┌─────────────────────────────────────────────────────┐
-│               IMMEDIATE BUFFER                       │
-│         (Last 10 messages / 5 interactions)          │
-│         Auto-expires after 1 hour of inactivity      │
-│         Oldest popped first on overflow              │
-└─────────────────────────────────────────────────────┘
-```
-
-**Time-gap awareness**: Messages separated by >30 minutes get `[TIME GAP]` markers in the chat history, helping Aika treat overnight or long gaps as separate conversations.
-
-## 🔧 Available Tools
+## 🔧 Tools
 
 | Tool | Description |
 |------|-------------|
-| `execute_shell_command(cmd)` | Run shell commands on the host |
+| `execute_shell_command(cmd)` | Run shell commands (60s timeout) |
 | `read_file(path)` | Read file contents |
 | `write_file(path, content)` | Write content to a file |
 | `list_directory(path)` | List directory contents |
-| `schedule_wake_up(seconds, thought)` | Schedule a self-initiated check-in |
-| `read_server_logs(lines)` | Read Aika's own server logs (last N lines) |
-
-## 🎙️ Voice Messages
-
-1. Send a voice message to the bot
-2. Transcribed using Groq's Whisper (whisper-large-v3-turbo)
-3. Stored in memory with `[VOICE]` prefix
-4. Processed like regular text
+| `schedule_wake_up(seconds, thought)` | Schedule self-initiated check-in |
+| `read_server_logs(lines)` | Read Aika's own server logs |
 
 ## 🔒 Security
 
@@ -199,13 +198,6 @@ sudo journalctl -u aika -f
 tail -f aika.log
 
 # If running directly, logs output to stdout
-```
-
-Check database:
-
-```bash
-sqlite3 aika.db "SELECT * FROM messages ORDER BY id DESC LIMIT 10;"
-sqlite3 aika.db "SELECT * FROM summaries;"
 ```
 
 ## 🛠️ Troubleshooting

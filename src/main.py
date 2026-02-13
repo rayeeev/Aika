@@ -37,6 +37,10 @@ GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_RAW.split(",") if key.
 # --- Logging Setup ---
 LOG_FILE = Path(os.path.dirname(os.path.dirname(__file__))) / "aika.log"
 
+# Clear log on startup
+if LOG_FILE.exists():
+    LOG_FILE.write_text("")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -63,6 +67,10 @@ except (TypeError, ValueError):
     sys.exit(1)
 
 TIMEZONE = ZoneInfo("America/Los_Angeles")
+
+# Context budget constants
+MAX_MESSAGE_CHARS = 1500     # Per-message truncation limit
+MAX_HISTORY_CHARS = 12000    # Total chat history character budget
 
 # Temp directory for audio files
 AUDIO_TEMP_DIR = Path(tempfile.gettempdir()) / "aika_audio"
@@ -341,7 +349,7 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         f"{recalled_memories}"
     )
 
-    # Build chat history with time-gap markers
+    # Build chat history with time-gap markers and per-message truncation
     chat_history = []
     for i, msg in enumerate(history):
         # Insert time gap marker if >30 min gap from previous message
@@ -359,10 +367,21 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
                 ))
 
         role = "user" if msg["role"] == "user" else "model"
+        content = msg["content"]
+        # Truncate oversized messages (e.g. long tool output or pasted text)
+        if len(content) > MAX_MESSAGE_CHARS:
+            content = content[:MAX_MESSAGE_CHARS] + "\n...[truncated]"
         chat_history.append(genai_types.Content(
             role=role,
-            parts=[genai_types.Part(text=msg["content"])]
+            parts=[genai_types.Part(text=content)]
         ))
+
+    # Enforce total history character budget — drop oldest messages first
+    def _history_chars(h):
+        return sum(len(p.text) for c in h for p in c.parts if hasattr(p, 'text') and p.text)
+
+    while _history_chars(chat_history) > MAX_HISTORY_CHARS and len(chat_history) > 2:
+        chat_history.pop(0)
 
     # Try each API key until one works
     last_error = None
@@ -382,7 +401,18 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
                 history=chat_history
             )
             response = chat.send_message(user_text)
-            return response.text
+            text = response.text
+            if text is None:
+                # AFC exhausted — chat history has tool results, ask model to wrap up
+                logger.warning("Gemini AFC exhausted. Asking model to summarize findings.")
+                try:
+                    followup = chat.send_message(
+                        "You hit your tool call limit. Summarize what you've found so far and ask Erden if he wants you to continue."
+                    )
+                    return followup.text or "I gathered some info but couldn't finish. Want me to continue?"
+                except Exception:
+                    return "I gathered some info but couldn't finish. Want me to continue?"
+            return text
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini API key {i + 1}/{len(gemini_clients)} failed: {e}")
@@ -403,7 +433,7 @@ async def process_user_input(message: Message, user_text: str, is_voice: bool = 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         response_text = await generate_response(user_text)
 
-    if response_text.strip() == "[SILENCE]":
+    if not response_text or response_text.strip() == "[SILENCE]":
         logger.info("Aika chose silence.")
         # Store memory in background — don't block
         asyncio.create_task(_store_messages(stored_text, "[CHOSE SILENCE]"))
