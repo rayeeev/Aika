@@ -256,10 +256,12 @@ def format_time_gap(seconds: float) -> str:
 # --- Core Logic ---
 
 async def _store_messages(user_text: str, model_text: str):
-    """Store message pair in memory. Runs as a background task to avoid blocking replies."""
+    """Store message pair + extract memories + run decay. Background task."""
     try:
         await memory.add_message("user", user_text)
         await memory.add_message("model", model_text)
+        await memory.extract_and_store_memories(user_text, model_text)
+        await memory.run_decay()
     except Exception as e:
         logger.error(f"Failed to store messages in memory: {e}")
 
@@ -285,12 +287,11 @@ async def wake_up_callback(thought: str):
 async def generate_response(user_text: str, is_self_initiated: bool = False) -> str:
     """Generates a response from Gemini, handling tools and history."""
 
-    # Retrieve recent history (Buffer) — now includes timestamps
+    # Retrieve recent history (Buffer)
     history = await memory.get_recent_messages()
 
-    # Retrieve Summaries
-    global_sum = await memory.get_summary("global_summary") or "(None)"
-    weekly_sum = await memory.get_summary("weekly_summary") or "(None)"
+    # Retrieve relevant memories via cue-based recall
+    recalled_memories = await memory.retrieve_relevant_memories(user_text)
 
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -306,9 +307,9 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         "Note: Messages prefixed with [VOICE] were transcribed from voice messages. "
         "\n\n"
         "=== CRITICAL: TOOL USAGE RULES ===\n"
-        "You have VERY LIMITED API calls per minute. Every tool call costs a round-trip. Follow these rules strictly:\n\n"
-        "1. NEVER use tools for casual conversation. If Erden says 'hi', 'how are you', asks about memories, "
-        "feelings, opinions, or anything conversational — just respond directly from your memory summaries below. "
+        "You have VERY LIMITED API calls per minute (try to stay under 4 calls per minute). Every tool call costs a round-trip. Follow these rules strictly:\n\n"
+        "1. NEVER use tools for casual conversation. If Erden says 'hi', 'how are you', "
+        "feelings, opinions, or anything conversational — just respond directly using your recalled memories below.  "
         "DO NOT call read_file, list_directory, read_server_logs, or any tool for conversational messages.\n\n"
         "2. ONLY use tools when Erden EXPLICITLY asks you to perform a system action, such as:\n"
         "   - 'Run this command...', 'Check disk space', 'Read this file', 'Write this file'\n"
@@ -334,8 +335,10 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         "Treat large gaps (hours, overnight) as separate conversations. "
         "Don't continue a topic from hours ago as if talking mid-sentence — acknowledge the new context naturally. "
         "If the last interaction was late at night and now it's morning, treat it as a new day.\n\n"
-        f"=== LONG-TERM MEMORY (Global Summary) ===\n{global_sum}\n\n"
-        f"=== SHORT-TERM MEMORY (Weekly Summary) ===\n{weekly_sum}"
+        f"=== RECALLED MEMORIES ===\n"
+        f"These are memories retrieved based on the current conversation. "
+        f"Higher strength = more reliable. Use them naturally — don't list them back to Erden.\n\n"
+        f"{recalled_memories}"
     )
 
     # Build chat history with time-gap markers
@@ -491,8 +494,8 @@ async def shutdown(signal_type):
 async def main():
     await memory.init_db()
 
-    # Schedule weekly reset: Sunday at midnight
-    scheduler.add_job(memory.execute_weekly_reset, 'cron', day_of_week='sun', hour=0, minute=0)
+    # Schedule nightly memory consolidation at 4 AM
+    scheduler.add_job(memory.run_nightly_consolidation, 'cron', hour=4, minute=0)
     scheduler.start()
 
     # Setup graceful shutdown handlers
