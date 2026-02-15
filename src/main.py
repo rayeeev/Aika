@@ -68,10 +68,6 @@ except (TypeError, ValueError):
 
 TIMEZONE = ZoneInfo("America/Los_Angeles")
 
-# Context budget constants
-MAX_MESSAGE_CHARS = 1500     # Per-message truncation limit
-MAX_HISTORY_CHARS = 12000    # Total chat history character budget
-
 # Temp directory for audio files
 AUDIO_TEMP_DIR = Path(tempfile.gettempdir()) / "aika_audio"
 AUDIO_TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -243,7 +239,20 @@ def read_server_logs(lines: int = 50) -> str:
         return f"Failed to read logs: {str(e)}"
 
 
-tools_list = [execute_shell_command, read_file, write_file, list_directory, schedule_wake_up, read_server_logs]
+def recall_memory(query_type: str, date: str = "", time_range: str = "") -> str:
+    """
+    Retrieve stored memories. Call this ONCE per request with the correct parameters.
+    Rules:
+    - User gave a specific day AND time interval → query_type="conversation", date="YYYY-MM-DD", time_range="HH:MM-HH:MM"
+    - User gave a specific day only → query_type="day", date="YYYY-MM-DD"
+    - User asked about memory with no specifics → query_type="global"
+    """
+    return asyncio.get_event_loop().run_until_complete(
+        memory.recall_memory(query_type, date, time_range)
+    )
+
+
+tools_list = [execute_shell_command, read_file, write_file, list_directory, schedule_wake_up, read_server_logs, recall_memory]
 
 
 # --- Helper ---
@@ -264,12 +273,10 @@ def format_time_gap(seconds: float) -> str:
 # --- Core Logic ---
 
 async def _store_messages(user_text: str, model_text: str):
-    """Store message pair + extract memories + run decay. Background task."""
+    """Store message pair in background."""
     try:
         await memory.add_message("user", user_text)
         await memory.add_message("model", model_text)
-        await memory.extract_and_store_memories(user_text, model_text)
-        await memory.run_decay()
     except Exception as e:
         logger.error(f"Failed to store messages in memory: {e}")
 
@@ -293,13 +300,21 @@ async def wake_up_callback(thought: str):
 
 
 async def generate_response(user_text: str, is_self_initiated: bool = False) -> str:
-    """Generates a response from Gemini, handling tools and history."""
+    """Generates a response from Gemini, using conversation context and memories."""
 
-    # Retrieve recent history (Buffer)
-    history = await memory.get_recent_messages()
+    # Retrieve conversation context (CC summary + immediate buffer)
+    cc = await memory.get_conversation_context()
+    cc_summary = cc["summary"]
+    cc_messages = cc["messages"]
 
-    # Retrieve relevant memories via cue-based recall
-    recalled_memories = await memory.retrieve_relevant_memories(user_text)
+    # Retrieve today's conversation summaries
+    today_summaries = await memory.get_today_conversation_summaries()
+
+    # Retrieve semantic memories
+    semantic_memories = await memory.get_semantic_memories()
+
+    # Retrieve appropriate episodic memories (Groq filter)
+    appropriate_memories = await memory.get_appropriate_memories(user_text)
 
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -317,7 +332,7 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         "=== CRITICAL: TOOL USAGE RULES ===\n"
         "You have VERY LIMITED API calls per minute (try to stay under 4 calls per minute). Every tool call costs a round-trip. Follow these rules strictly:\n\n"
         "1. NEVER use tools for casual conversation. If Erden says 'hi', 'how are you', "
-        "feelings, opinions, or anything conversational — just respond directly using your recalled memories below.  "
+        "feelings, opinions, or anything conversational — just respond directly using your memories below.  "
         "DO NOT call read_file, list_directory, read_server_logs, or any tool for conversational messages.\n\n"
         "2. ONLY use tools when Erden EXPLICITLY asks you to perform a system action, such as:\n"
         "   - 'Run this command...', 'Check disk space', 'Read this file', 'Write this file'\n"
@@ -331,30 +346,52 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         "4. MAXIMUM 2 tool calls per message. If a task needs more, tell Erden what you found so far "
         "and ask if he wants you to continue.\n\n"
         "5. If you use a tool, you MUST use the output to inform your final response.\n\n"
+        "6. recall_memory: Use this ONLY when Erden explicitly asks about past conversations or memories.\n"
+        "   Call it ONCE with the right parameters:\n"
+        "   - User gave time interval AND day → query_type='conversation', date='YYYY-MM-DD', time_range='HH:MM-HH:MM'\n"
+        "   - User gave a day → query_type='day', date='YYYY-MM-DD'\n"
+        "   - User asked about memory in general → query_type='global'\n\n"
         "=== AVAILABLE TOOLS (use sparingly) ===\n"
         "- execute_shell_command: Run shell commands. Combine multiple commands with && or ;\n"
         "- read_file / write_file: Read or write files\n"
         "- list_directory: List directory contents\n"
         "- schedule_wake_up: Schedule a self-initiated wake-up for reminders or delayed tasks\n"
-        "- read_server_logs: Read your own server logs (for debugging only)\n\n"
+        "- read_server_logs: Read your own server logs (for debugging only)\n"
+        "- recall_memory: Retrieve stored global/day/conversation memories (for explicit user requests only)\n\n"
         "=== TIME AWARENESS ===\n"
         f"Current Time: {now_str}\n"
         "Messages in your history may contain [TIME GAP: ...] markers showing elapsed time between interactions. "
         "Treat large gaps (hours, overnight) as separate conversations. "
         "Don't continue a topic from hours ago as if talking mid-sentence — acknowledge the new context naturally. "
         "If the last interaction was late at night and now it's morning, treat it as a new day.\n\n"
-        f"=== RECALLED MEMORIES ===\n"
-        f"These are memories retrieved based on the current conversation. "
-        f"Higher strength = more reliable. Use them naturally — don't list them back to Erden.\n\n"
-        f"{recalled_memories}"
+        f"=== TODAY'S EARLIER CONVERSATIONS ===\n"
+        f"{today_summaries}\n\n"
+        f"=== SEMANTIC MEMORIES (stable facts & knowledge) ===\n"
+        f"{semantic_memories}\n\n"
+        f"=== RELEVANT EPISODIC MEMORIES ===\n"
+        f"These are episodic memories filtered for relevance to the current message. Use them naturally.\n"
+        f"{appropriate_memories}"
     )
 
-    # Build chat history with time-gap markers and per-message truncation
+    # Build chat history from CC
     chat_history = []
-    for i, msg in enumerate(history):
+
+    # Add CC summary as context preamble if it exists
+    if cc_summary:
+        chat_history.append(genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=f"[CONVERSATION CONTEXT SUMMARY]: {cc_summary}")]
+        ))
+        chat_history.append(genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text="[Acknowledged — I have context from earlier in this conversation]")]
+        ))
+
+    # Add immediate buffer messages with time-gap markers
+    for i, msg in enumerate(cc_messages):
         # Insert time gap marker if >30 min gap from previous message
-        if i > 0 and "timestamp" in history[i - 1] and "timestamp" in msg:
-            gap_seconds = msg["timestamp"] - history[i - 1]["timestamp"]
+        if i > 0 and "timestamp" in cc_messages[i - 1] and "timestamp" in msg:
+            gap_seconds = msg["timestamp"] - cc_messages[i - 1]["timestamp"]
             if gap_seconds > 1800:  # 30 minutes
                 gap_str = format_time_gap(gap_seconds)
                 chat_history.append(genai_types.Content(
@@ -368,20 +405,10 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
 
         role = "user" if msg["role"] == "user" else "model"
         content = msg["content"]
-        # Truncate oversized messages (e.g. long tool output or pasted text)
-        if len(content) > MAX_MESSAGE_CHARS:
-            content = content[:MAX_MESSAGE_CHARS] + "\n...[truncated]"
         chat_history.append(genai_types.Content(
             role=role,
             parts=[genai_types.Part(text=content)]
         ))
-
-    # Enforce total history character budget — drop oldest messages first
-    def _history_chars(h):
-        return sum(len(p.text) for c in h for p in c.parts if hasattr(p, 'text') and p.text)
-
-    while _history_chars(chat_history) > MAX_HISTORY_CHARS and len(chat_history) > 2:
-        chat_history.pop(0)
 
     # Try each API key until one works
     last_error = None
@@ -524,8 +551,14 @@ async def shutdown(signal_type):
 async def main():
     await memory.init_db()
 
-    # Schedule nightly memory consolidation at 4 AM
-    scheduler.add_job(memory.run_nightly_consolidation, 'cron', hour=4, minute=0)
+    # Schedule conversation timeout check every 5 minutes
+    scheduler.add_job(memory.close_stale_conversations, 'interval', minutes=5)
+
+    # Schedule nightly jobs
+    scheduler.add_job(memory.run_daily_summary, 'cron', hour=4, minute=0)
+    scheduler.add_job(memory.run_global_update, 'cron', hour=4, minute=10)
+    scheduler.add_job(memory.run_weekly_cleanup, 'cron', day_of_week='sun', hour=4, minute=20)
+
     scheduler.start()
 
     # Setup graceful shutdown handlers
@@ -533,7 +566,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
 
-    logger.info("Aika (Autonomy Enabled) Started")
+    logger.info("Aika (Memory V3) Started")
     logger.info(f"Audio temp directory: {AUDIO_TEMP_DIR}")
 
     if SEND_STARTUP_MESSAGE:

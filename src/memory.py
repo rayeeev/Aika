@@ -1,60 +1,35 @@
 import aiosqlite
 import asyncio
 import json
-import math
 import re
 import time
 import os
 import logging
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
+from zoneinfo import ZoneInfo
 from groq import Groq
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("AIKA_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "aika.db"))
+TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 # --- Configuration ---
-BUFFER_MAX_MESSAGES = 20
-BUFFER_EXPIRY_SECONDS = 3600  # 1 hour
-MAX_RETRIEVED_MEMORIES = 10
-MAX_MEMORY_CONTEXT_CHARS = 4000  # Character budget for recalled memory cards
-DECAY_NODE_HALFLIFE = 0.995   # per hour
-DECAY_EDGE_HALFLIFE = 0.99    # per hour (edges decay faster)
-DEAD_EDGE_THRESHOLD = 0.01
-ARCHIVE_STRENGTH_THRESHOLD = 0.05
-ARCHIVE_DAYS = 30
-
-# Stopwords for keyword extraction (kept minimal)
-STOPWORDS = frozenset({
-    "i", "me", "my", "you", "your", "we", "us", "our", "it", "its",
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "can", "may", "might", "shall", "must",
-    "to", "of", "in", "on", "at", "by", "for", "with", "from", "up",
-    "about", "into", "through", "during", "before", "after",
-    "and", "but", "or", "nor", "not", "no", "so", "if", "then",
-    "that", "this", "these", "those", "what", "which", "who", "whom",
-    "how", "when", "where", "why", "all", "each", "every", "both",
-    "just", "also", "very", "too", "only", "really", "much", "more",
-    "some", "any", "than", "like", "get", "got", "go", "going",
-    "thing", "things", "something", "anything", "ok", "okay", "yeah",
-    "yes", "no", "hey", "hi", "hello", "please", "thanks", "thank",
-    "sure", "right", "well", "now", "here", "there",
-})
-
-
-def extract_keywords(text: str) -> List[str]:
-    """Extract meaningful keywords from text using simple tokenization."""
-    tokens = re.findall(r'[a-zA-Z0-9_/.-]+', text.lower())
-    keywords = [t for t in tokens if t not in STOPWORDS and len(t) > 1]
-    return list(dict.fromkeys(keywords))[:20]  # Deduplicate, cap at 20
+CONVERSATION_GAP_SECONDS = 1800  # 30 minutes → new conversation
+IMMEDIATE_BUFFER_INTERACTIONS = 10  # 10 interactions = 20 messages max
+CC_SUMMARY_MAX_SENTENCES = 3
+CONVERSATION_SUMMARY_MAX_SENTENCES = 4
+DAY_SUMMARY_MAX_SENTENCES = 3
+GLOBAL_SUMMARY_MAX_SENTENCES = 4
 
 
 class Memory:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self.groq_client: Optional[Groq] = None
-        self.model_name = "qwen/qwen3-32b"
+        self.extraction_model = "qwen/qwen3-32b"
+        self.filter_model = "llama-3.1-8b-instant"
         self._lock = asyncio.Lock()
 
     def set_groq_client(self, client: Groq):
@@ -65,485 +40,770 @@ class Memory:
     async def init_db(self):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    summary TEXT,
+                    is_closed INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     timestamp REAL NOT NULL
                 )
             """)
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS memory_nodes (
+                CREATE TABLE IF NOT EXISTS conversation_context (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type TEXT NOT NULL,
-                    title TEXT NOT NULL,
+                    conversation_id INTEGER NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+                    summary_text TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS episodic_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     content TEXT NOT NULL,
-                    strength REAL NOT NULL DEFAULT 1.0,
-                    created_at REAL NOT NULL,
-                    last_accessed REAL NOT NULL,
-                    access_count INTEGER NOT NULL DEFAULT 0,
-                    metadata TEXT
+                    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+                    created_at REAL NOT NULL
                 )
             """)
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS memory_edges (
+                CREATE TABLE IF NOT EXISTS semantic_memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id INTEGER NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
-                    target_id INTEGER NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
-                    weight REAL NOT NULL DEFAULT 1.0,
-                    relation TEXT,
-                    created_at REAL NOT NULL,
-                    last_used REAL NOT NULL,
-                    UNIQUE(source_id, target_id)
+                    content TEXT NOT NULL,
+                    created_at REAL NOT NULL
                 )
             """)
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS memory_cues (
+                CREATE TABLE IF NOT EXISTS day_memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    node_id INTEGER NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
-                    cue_type TEXT NOT NULL,
-                    cue_value TEXT NOT NULL
+                    date TEXT NOT NULL UNIQUE,
+                    summary TEXT NOT NULL
                 )
             """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_cues_value ON memory_cues(cue_value)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_cues_node ON memory_cues(node_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_strength ON memory_nodes(strength)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id)")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS global_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_conv_closed ON conversations(is_closed)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_episodic_created ON episodic_memories(created_at)")
             await db.commit()
 
-    # ── Working Set (Buffer) ────────────────────────────────
+    # ── Conversation Lifecycle ──────────────────────────────
+
+    async def _get_active_conversation(self, db) -> Optional[int]:
+        """Get the currently open conversation ID, or None."""
+        cursor = await db.execute(
+            "SELECT id FROM conversations WHERE is_closed = 0 ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def _get_last_message_time(self, db, conv_id: int) -> Optional[float]:
+        """Get the timestamp of the last message in a conversation."""
+        cursor = await db.execute(
+            "SELECT timestamp FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+            (conv_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def _create_conversation(self, db, now: float) -> int:
+        """Create a new conversation and its empty CC row."""
+        cursor = await db.execute(
+            "INSERT INTO conversations (started_at, is_closed) VALUES (?, 0)",
+            (now,)
+        )
+        conv_id = cursor.lastrowid
+        await db.execute(
+            "INSERT INTO conversation_context (conversation_id, summary_text, updated_at) VALUES (?, '', ?)",
+            (conv_id, now)
+        )
+        await db.commit()
+        logger.info(f"Created new conversation {conv_id}")
+        return conv_id
 
     async def add_message(self, role: str, content: str):
-        """Insert a message into the buffer and enforce size cap."""
+        """Insert a message. Handles conversation boundaries and CC overflow."""
+        now = time.time()
         async with self._lock:
             async with aiosqlite.connect(self.db_path) as db:
+                conv_id = await self._get_active_conversation(db)
+
+                if conv_id is not None:
+                    last_ts = await self._get_last_message_time(db, conv_id)
+                    if last_ts and (now - last_ts) > CONVERSATION_GAP_SECONDS:
+                        # Gap detected → close old conversation, open new one
+                        await self._close_conversation_internal(db, conv_id, now)
+                        conv_id = await self._create_conversation(db, now)
+                else:
+                    conv_id = await self._create_conversation(db, now)
+
+                # Insert the message
                 await db.execute(
-                    "INSERT INTO messages (role, content, timestamp) VALUES (?, ?, ?)",
-                    (role, content, time.time())
+                    "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                    (conv_id, role, content, now)
                 )
-                # Delete messages older than 1 hour
-                cutoff = time.time() - BUFFER_EXPIRY_SECONDS
-                await db.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
-                # Enforce cap: keep newest BUFFER_MAX_MESSAGES
-                await db.execute("""
-                    DELETE FROM messages WHERE id NOT IN (
-                        SELECT id FROM messages ORDER BY id DESC LIMIT ?
-                    )
-                """, (BUFFER_MAX_MESSAGES,))
                 await db.commit()
 
-    async def get_recent_messages(self, limit: int = 20) -> List[Dict]:
-        """Get recent messages from the buffer with timestamps."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT role, content, timestamp FROM messages ORDER BY id ASC LIMIT ?",
-                (limit,)
-            )
-            rows = await cursor.fetchall()
-            return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+                # Check if we need to update CC summary (buffer overflow)
+                await self._maybe_update_cc(db, conv_id)
 
-    # ── Ingest Pipeline ─────────────────────────────────────
+    async def _maybe_update_cc(self, db, conv_id: int):
+        """If the conversation has more than IMMEDIATE_BUFFER_INTERACTIONS interactions,
+        fold the oldest interaction into the CC summary."""
+        # Count total messages in this conversation
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+            (conv_id,)
+        )
+        total_messages = (await cursor.fetchone())[0]
+        buffer_messages = IMMEDIATE_BUFFER_INTERACTIONS * 2  # 10 interactions = 20 messages
 
-    async def extract_and_store_memories(self, user_text: str, model_text: str):
-        """Extract structured memories from a conversation turn via Groq, then store."""
-        if not self.groq_client:
+        if total_messages <= buffer_messages:
+            return  # Buffer not overflowing
+
+        # Get messages that are outside the buffer (oldest ones to fold in)
+        overflow_count = total_messages - buffer_messages
+        cursor = await db.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+            (conv_id, overflow_count)
+        )
+        overflow_msgs = await cursor.fetchall()
+
+        if not overflow_msgs:
             return
+
+        # Get current CC summary
+        cursor = await db.execute(
+            "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+            (conv_id,)
+        )
+        row = await cursor.fetchone()
+        current_summary = row[0] if row else ""
+
+        # Build text of overflow messages
+        overflow_text = "\n".join(f"[{m[0]}]: {m[1]}" for m in overflow_msgs)
+
+        # Call Groq to fold into summary
+        new_summary = await self._summarize_cc(current_summary, overflow_text)
+        if new_summary:
+            await db.execute(
+                "UPDATE conversation_context SET summary_text = ?, updated_at = ? WHERE conversation_id = ?",
+                (new_summary, time.time(), conv_id)
+            )
+
+        # Delete the overflowed messages from the buffer
+        cursor = await db.execute(
+            "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+            (conv_id, overflow_count)
+        )
+        ids_to_delete = [r[0] for r in await cursor.fetchall()]
+        if ids_to_delete:
+            placeholders = ",".join(["?"] * len(ids_to_delete))
+            await db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete)
+
+        await db.commit()
+
+    async def _summarize_cc(self, current_summary: str, new_messages: str) -> Optional[str]:
+        """Use Groq to fold new messages into the CC summary (max 3 sentences)."""
+        if not self.groq_client:
+            return None
+
+        parts = []
+        if current_summary:
+            parts.append(f"Current conversation summary so far:\n{current_summary}")
+        parts.append(f"New messages to incorporate:\n{new_messages}")
 
         prompt = (
-            "Given this conversation turn, extract any memories WORTH storing (it's okay to store nothing if there isn't anything worth storing).\n"
-            "Return a JSON array (no markdown, no explanation). Each item:\n"
-            '{"type":"semantic|episodic|procedural","title":"1-line","content":"2-4 sentences",'
-            '"importance":1-5,"keywords":["word1","word2"],"entities":["name1"]}\n\n'
-            "Rules:\n"
-            "- semantic: stable facts, preferences, commitments, biographical info\n"
-            "- episodic: notable events, decisions, emotional moments worth remembering\n"
-            "- procedural: learned patterns about how the user wants things done\n"
-            "- Most casual turns produce 0 memories. Return [] if nothing worth storing.\n"
-            "- importance: 5=critical, 1=trivial. Only extract importance >= 2.\n\n"
-            f"[user]: {user_text}\n[model]: {model_text}\n\n"
-            "JSON array:"
+            "\n\n".join(parts) + "\n\n"
+            f"Summarize everything above into {CC_SUMMARY_MAX_SENTENCES} or fewer sentences. "
+            "Capture the key topics, decisions, and context. Output ONLY the summary, nothing else."
         )
 
-        try:
-            response = self.groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You extract structured memories from conversations. Output ONLY valid JSON arrays."},
-                    {"role": "user", "content": prompt}
-                ],
-                model=self.model_name,
-                temperature=0.3,
+        return await self._call_groq(
+            prompt,
+            system="You summarize conversation context concisely. Output ONLY the summary text.",
+            model=self.extraction_model,
+            temperature=0.3,
+        )
+
+    async def _close_conversation_internal(self, db, conv_id: int, now: float):
+        """Close a conversation: get full text, extract episodic memories, summarize."""
+        # Fetch ALL messages (buffer + we need the full convo for extraction)
+        # But we also need the CC summary for messages that were already folded
+        cursor = await db.execute(
+            "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+            (conv_id,)
+        )
+        cc_row = await cursor.fetchone()
+        cc_summary = cc_row[0] if cc_row and cc_row[0] else ""
+
+        cursor = await db.execute(
+            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+            (conv_id,)
+        )
+        messages = await cursor.fetchall()
+
+        if not messages:
+            await db.execute(
+                "UPDATE conversations SET is_closed = 1, ended_at = ? WHERE id = ?",
+                (now, conv_id)
             )
-            raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-
-            # Strip <think>...</think> blocks (qwen3 thinking mode)
-            raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-
-            # Strip markdown code fences if present
-            if raw.startswith("```"):
-                raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                raw = re.sub(r'\s*```$', '', raw)
-
-            if not raw:
-                return
-
-            memories = json.loads(raw)
-            if not isinstance(memories, list):
-                return
-
-            for mem in memories:
-                if not isinstance(mem, dict):
-                    continue
-                await self._store_extracted_memory(mem)
-
-        except (json.JSONDecodeError, Exception) as e:
-            logger.error(f"Memory extraction failed: {e}")
-
-    async def _store_extracted_memory(self, mem: Dict[str, Any]):
-        """Store a single extracted memory, deduplicating by cue overlap."""
-        mem_type = mem.get("type", "semantic")
-        title = mem.get("title", "")[:200]
-        content = mem.get("content", "")[:500]
-        importance = min(max(mem.get("importance", 1), 1), 5)
-        keywords = mem.get("keywords", [])[:10]
-        entities = mem.get("entities", [])[:5]
-
-        if not title or not content:
+            await db.commit()
             return
 
-        all_cues = [k.lower() for k in keywords] + [e.lower() for e in entities]
-        if not all_cues:
-            all_cues = extract_keywords(title + " " + content)[:8]
+        # Build full conversation text
+        full_text_parts = []
+        if cc_summary:
+            full_text_parts.append(f"[Earlier in conversation summary]: {cc_summary}")
+        for role, content, ts in messages:
+            full_text_parts.append(f"[{role}]: {content}")
+        full_text = "\n".join(full_text_parts)
 
+        # Get conversation time range
+        cursor = await db.execute(
+            "SELECT started_at FROM conversations WHERE id = ?",
+            (conv_id,)
+        )
+        started_at = (await cursor.fetchone())[0]
+        start_time = datetime.fromtimestamp(started_at, tz=TIMEZONE).strftime("%H:%M")
+        end_time = datetime.fromtimestamp(now, tz=TIMEZONE).strftime("%H:%M")
+        date_str = datetime.fromtimestamp(started_at, tz=TIMEZONE).strftime("%Y-%m-%d")
+        time_interval = f"{date_str} {start_time}–{end_time}"
+
+        # Call Groq for summary + episodic extraction (single call)
+        summary, episodic_memories = await self._extract_conversation_close(full_text, time_interval)
+
+        # Store summary
+        await db.execute(
+            "UPDATE conversations SET is_closed = 1, ended_at = ?, summary = ? WHERE id = ?",
+            (now, summary, conv_id)
+        )
+
+        # Store episodic memories
+        for mem in episodic_memories:
+            await db.execute(
+                "INSERT INTO episodic_memories (content, conversation_id, created_at) VALUES (?, ?, ?)",
+                (mem, conv_id, now)
+            )
+
+        await db.commit()
+        logger.info(f"Closed conversation {conv_id}: {len(episodic_memories)} episodic memories extracted")
+
+    async def _extract_conversation_close(self, full_text: str, time_interval: str) -> tuple:
+        """Extract conversation summary + episodic memories via Groq."""
+        if not self.groq_client:
+            return (f"[{time_interval}] (no summary available)", [])
+
+        prompt = (
+            f"Here is a full conversation:\n\n{full_text}\n\n"
+            f"Time interval: {time_interval}\n\n"
+            "Do two things:\n"
+            f"1. Summarize this conversation in {CONVERSATION_SUMMARY_MAX_SENTENCES} or fewer sentences.\n"
+            "2. Extract any episodic memories worth remembering (facts, situations, decisions, promises, preferences, notable events). "
+            "It's OK to return no episodic memories if there's nothing worth storing.\n\n"
+            "Return JSON (no markdown, no explanation):\n"
+            '{"summary": "...", "episodic": ["memory1", "memory2", ...]}\n'
+        )
+
+        raw = await self._call_groq(
+            prompt,
+            system="You extract conversation summaries and episodic memories. Output ONLY valid JSON.",
+            model=self.extraction_model,
+            temperature=0.3,
+        )
+
+        if not raw:
+            return (f"[{time_interval}] (extraction failed)", [])
+
+        try:
+            data = json.loads(raw)
+            summary = f"[{time_interval}] {data.get('summary', '(no summary)')}"
+            episodic = data.get("episodic", [])
+            if not isinstance(episodic, list):
+                episodic = []
+            episodic = [str(e) for e in episodic if e]
+            return (summary, episodic)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Conversation close extraction parse failed: {e}")
+            return (f"[{time_interval}] (parse failed)", [])
+
+    async def close_stale_conversations(self):
+        """Called periodically (e.g. every 5 min) to close conversations
+        where the last message was >30 min ago."""
         now = time.time()
-
-        async with aiosqlite.connect(self.db_path) as db:
-            # Check for existing node with ≥2 shared cues
-            if all_cues:
-                placeholders = ','.join(['?' for _ in all_cues])
-                cursor = await db.execute(f"""
-                    SELECT node_id, COUNT(*) as overlap
-                    FROM memory_cues
-                    WHERE cue_value IN ({placeholders})
-                    GROUP BY node_id
-                    HAVING overlap >= 2
-                    ORDER BY overlap DESC
-                    LIMIT 1
-                """, all_cues)
-                existing = await cursor.fetchone()
-
-                if existing:
-                    # Reinforce existing node
-                    node_id = existing[0]
-                    await db.execute("""
-                        UPDATE memory_nodes
-                        SET strength = MIN(strength + ? * 0.2, 5.0),
-                            last_accessed = ?,
-                            access_count = access_count + 1,
-                            content = ?
-                        WHERE id = ?
-                    """, (importance, now, content, node_id))
-                    await db.commit()
-                    logger.info(f"Reinforced existing memory node {node_id}: {title}")
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                conv_id = await self._get_active_conversation(db)
+                if conv_id is None:
                     return
 
-            # Insert new node
-            cursor = await db.execute("""
-                INSERT INTO memory_nodes (type, title, content, strength, created_at, last_accessed, access_count, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-            """, (mem_type, title, content, importance * 0.3, now, now,
-                  json.dumps({"keywords": keywords, "entities": entities})))
-            node_id = cursor.lastrowid
+                last_ts = await self._get_last_message_time(db, conv_id)
+                if last_ts and (now - last_ts) > CONVERSATION_GAP_SECONDS:
+                    logger.info(f"Closing stale conversation {conv_id} (idle for {int(now - last_ts)}s)")
+                    await self._close_conversation_internal(db, conv_id, now)
 
-            # Insert cues
-            for kw in keywords:
-                await db.execute(
-                    "INSERT INTO memory_cues (node_id, cue_type, cue_value) VALUES (?, 'keyword', ?)",
-                    (node_id, kw.lower())
-                )
-            for ent in entities:
-                await db.execute(
-                    "INSERT INTO memory_cues (node_id, cue_type, cue_value) VALUES (?, 'entity', ?)",
-                    (node_id, ent.lower())
-                )
+    # ── Context Retrieval (for prompt assembly) ─────────────
 
-            # Link to existing nodes that share cues (association edges)
-            if all_cues:
-                placeholders = ','.join(['?' for _ in all_cues])
-                cursor = await db.execute(f"""
-                    SELECT DISTINCT node_id FROM memory_cues
-                    WHERE cue_value IN ({placeholders}) AND node_id != ?
-                """, all_cues + [node_id])
-                related_ids = [r[0] for r in await cursor.fetchall()]
-
-                for related_id in related_ids[:5]:  # Max 5 edges per new node
-                    await db.execute("""
-                        INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, relation, created_at, last_used)
-                        VALUES (?, ?, 0.5, 'related_to', ?, ?)
-                    """, (node_id, related_id, now, now))
-
-            await db.commit()
-            logger.info(f"Stored new {mem_type} memory: {title}")
-
-    # ── Retrieval Pipeline ──────────────────────────────────
-
-    async def retrieve_relevant_memories(self, user_text: str) -> str:
-        """Retrieve relevant memory cards for the current turn. Returns formatted string."""
-        keywords = extract_keywords(user_text)
-        if not keywords:
-            return "(No memories recalled)"
-
-        now = time.time()
-
+    async def get_conversation_context(self) -> Dict[str, Any]:
+        """Returns the CC for the active conversation:
+        {"summary": str, "messages": [{"role": ..., "content": ..., "timestamp": ...}]}
+        """
         async with aiosqlite.connect(self.db_path) as db:
-            # Step 1: Find candidate nodes via cue matching
-            placeholders = ','.join(['?' for _ in keywords])
-            cursor = await db.execute(f"""
-                SELECT mn.id, mn.type, mn.title, mn.content, mn.strength,
-                       mn.last_accessed, mn.access_count, COUNT(mc.id) as cue_hits
-                FROM memory_cues mc
-                JOIN memory_nodes mn ON mc.node_id = mn.id
-                WHERE mc.cue_value IN ({placeholders})
-                  AND mn.type NOT LIKE 'archived_%'
-                  AND mn.strength > {DEAD_EDGE_THRESHOLD}
-                GROUP BY mn.id
-                ORDER BY cue_hits DESC, mn.strength DESC
-                LIMIT 30
-            """, keywords)
-            candidates = await cursor.fetchall()
+            conv_id = await self._get_active_conversation(db)
+            if conv_id is None:
+                return {"summary": "", "messages": []}
 
-            if not candidates:
-                return "(No memories recalled)"
-
-            # Step 2: Spreading activation — 1 hop from top candidates
-            top_ids = [c[0] for c in candidates[:5]]
-            if top_ids:
-                id_placeholders = ','.join(['?' for _ in top_ids])
-                cursor = await db.execute(f"""
-                    SELECT mn.id, mn.type, mn.title, mn.content, mn.strength,
-                           mn.last_accessed, mn.access_count, me.weight as edge_weight
-                    FROM memory_edges me
-                    JOIN memory_nodes mn ON (
-                        (me.target_id = mn.id AND me.source_id IN ({id_placeholders}))
-                        OR (me.source_id = mn.id AND me.target_id IN ({id_placeholders}))
-                    )
-                    WHERE mn.type NOT LIKE 'archived_%'
-                      AND mn.strength > {DEAD_EDGE_THRESHOLD}
-                      AND me.weight > 0.1
-                    LIMIT 10
-                """, top_ids + top_ids)
-                hop_results = await cursor.fetchall()
-
-                # Merge hop results into candidates (avoid duplicates)
-                existing_ids = {c[0] for c in candidates}
-                for hop in hop_results:
-                    if hop[0] not in existing_ids:
-                        candidates.append(hop[:7] + (1,))  # cue_hits=1 for hop results
-                        existing_ids.add(hop[0])
-
-            # Step 3: Score and rank
-            scored = []
-            for c in candidates:
-                node_id, mem_type, title, content, strength, last_accessed, access_count, cue_hits = c
-                hours_since = max((now - last_accessed) / 3600, 0.01)
-                recency_boost = 1.0 / (1.0 + math.log(1 + hours_since))
-                score = cue_hits * 1.0 + 0.6 * strength + 0.3 * recency_boost
-                scored.append((score, node_id, mem_type, title, content, strength, last_accessed))
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top = scored[:MAX_RETRIEVED_MEMORIES]
-
-            # Step 4: Reinforce retrieved nodes
-            for item in top:
-                node_id = item[1]
-                await db.execute("""
-                    UPDATE memory_nodes
-                    SET strength = MIN(strength + 0.1, 5.0),
-                        last_accessed = ?,
-                        access_count = access_count + 1
-                    WHERE id = ?
-                """, (now, node_id))
-
-            # Reinforce edges between co-retrieved nodes
-            retrieved_ids = [item[1] for item in top]
-            for i, id_a in enumerate(retrieved_ids):
-                for id_b in retrieved_ids[i+1:]:
-                    await db.execute("""
-                        UPDATE memory_edges
-                        SET weight = MIN(weight + 0.05, 5.0), last_used = ?
-                        WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)
-                    """, (now, id_a, id_b, id_b, id_a))
-
-            await db.commit()
-
-        # Step 5: Format memory cards
-        if not top:
-            return "(No memories recalled)"
-
-        cards = []
-        total_chars = 0
-        for score, node_id, mem_type, title, content, strength, last_accessed in top:
-            hours_ago = (now - last_accessed) / 3600
-            if hours_ago < 1:
-                time_str = f"{int(hours_ago * 60)}m ago"
-            elif hours_ago < 24:
-                time_str = f"{int(hours_ago)}h ago"
-            else:
-                time_str = f"{int(hours_ago / 24)}d ago"
-
-            emoji = {"semantic": "💡", "episodic": "📅", "procedural": "⚙️"}.get(mem_type, "📌")
-            card = (
-                f"{emoji} [{mem_type.upper()}] {title}\n"
-                f"   {content}\n"
-                f"   strength: {strength:.1f} | last: {time_str}"
-            )
-            # Enforce character budget — stop adding cards if over limit
-            if total_chars + len(card) > MAX_MEMORY_CONTEXT_CHARS and cards:
-                logger.info(f"Memory context budget reached ({total_chars} chars, {len(cards)} cards). Skipping remaining.")
-                break
-            cards.append(card)
-            total_chars += len(card) + 2  # +2 for "\n\n" join separator
-
-        return "\n\n".join(cards)
-
-    # ── Decay Pipeline ──────────────────────────────────────
-
-    async def run_decay(self):
-        """Apply time-based decay to node strengths and edge weights."""
-        now = time.time()
-        async with aiosqlite.connect(self.db_path) as db:
-            # Fetch and update nodes
+            # Get CC summary
             cursor = await db.execute(
-                "SELECT id, strength, last_accessed, access_count FROM memory_nodes WHERE strength > ?",
-                (DEAD_EDGE_THRESHOLD,)
+                "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+                (conv_id,)
             )
-            nodes = await cursor.fetchall()
-            for node_id, strength, last_accessed, access_count in nodes:
-                hours = max((now - last_accessed) / 3600, 0)
-                # Nodes with high access_count decay slower
-                effective_hours = hours / (1 + math.log(1 + access_count))
-                new_strength = strength * (DECAY_NODE_HALFLIFE ** effective_hours)
-                if abs(new_strength - strength) > 0.001:
-                    await db.execute(
-                        "UPDATE memory_nodes SET strength = ? WHERE id = ?",
-                        (new_strength, node_id)
-                    )
+            row = await cursor.fetchone()
+            summary = row[0] if row and row[0] else ""
 
-            # Decay edges
-            await db.execute(f"""
-                UPDATE memory_edges
-                SET weight = weight * POWER({DECAY_EDGE_HALFLIFE}, (? - last_used) / 3600.0)
-                WHERE weight > {DEAD_EDGE_THRESHOLD}
-            """, (now,))
+            # Get buffered messages (the immediate buffer)
+            cursor = await db.execute(
+                "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+                (conv_id,)
+            )
+            messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in await cursor.fetchall()]
 
-            # Prune dead edges
-            await db.execute(f"DELETE FROM memory_edges WHERE weight < {DEAD_EDGE_THRESHOLD}")
+            return {"summary": summary, "messages": messages}
 
-            # Archive dead nodes
-            archive_cutoff = now - (ARCHIVE_DAYS * 86400)
-            await db.execute("""
-                UPDATE memory_nodes
-                SET type = 'archived_' || type
-                WHERE strength < ?
-                  AND last_accessed < ?
-                  AND type NOT LIKE 'archived_%'
-            """, (ARCHIVE_STRENGTH_THRESHOLD, archive_cutoff))
+    async def get_today_conversation_summaries(self) -> str:
+        """Get summaries of all closed conversations from today."""
+        today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+        # Get start of today in epoch
+        today_start = datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+        today_epoch = today_start.timestamp()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                (today_epoch,)
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return "(No earlier conversations today)"
+
+        parts = []
+        for i, (summary,) in enumerate(rows, 1):
+            parts.append(f"{i}. {summary}")
+        return "\n".join(parts)
+
+    async def get_semantic_memories(self) -> str:
+        """Get all semantic memories."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT content FROM semantic_memories ORDER BY created_at DESC"
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return "(No semantic memories)"
+
+        return "\n".join(f"• {r[0]}" for r in rows)
+
+    async def get_appropriate_memories(self, user_text: str) -> str:
+        """Use a fast Groq model to filter episodic memories for relevance."""
+        if not self.groq_client:
+            return "(No episodic memory filter available)"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC LIMIT 100"
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return "(No episodic memories)"
+
+        memories_text = "\n".join(f"[{r[0]}] {r[1]}" for r in rows)
+
+        prompt = (
+            f"User's current message: {user_text}\n\n"
+            f"Here are all stored episodic memories:\n{memories_text}\n\n"
+            "Which of these memories are relevant to the user's current message? "
+            "Return ONLY the IDs of relevant memories as a JSON array, like [1, 5, 12]. "
+            "If none are relevant, return []. Output ONLY the JSON array."
+        )
+
+        raw = await self._call_groq(
+            prompt,
+            system="You filter memories for relevance. Output ONLY a JSON array of IDs.",
+            model=self.filter_model,
+            temperature=0.1,
+        )
+
+        if not raw:
+            return "(Memory filter unavailable)"
+
+        try:
+            ids = json.loads(raw)
+            if not isinstance(ids, list) or not ids:
+                return "(No relevant episodic memories)"
+
+            # Fetch the relevant ones
+            relevant = [r[1] for r in rows if r[0] in ids]
+            if not relevant:
+                return "(No relevant episodic memories)"
+
+            return "\n".join(f"• {m}" for m in relevant)
+        except (json.JSONDecodeError, Exception):
+            return "(Memory filter error)"
+
+    # ── Scheduled Jobs ──────────────────────────────────────
+
+    async def run_daily_summary(self):
+        """4:00 AM — Summarize today's conversations into a day memory.
+        Also analyze episodic memories to create semantic memories."""
+        if not self.groq_client:
+            return
+
+        # Use yesterday's date (since it's 4 AM, we're summarizing the previous day)
+        yesterday = datetime.now(TIMEZONE) - timedelta(days=1)
+        date_str = yesterday.strftime("%Y-%m-%d")
+        day_start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get all conversation summaries from yesterday
+            cursor = await db.execute(
+                "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                (day_start.timestamp(), day_end.timestamp())
+            )
+            conv_summaries = [r[0] for r in await cursor.fetchall()]
+
+            if not conv_summaries:
+                logger.info(f"Daily summary: no conversations found for {date_str}")
+                return
+
+            # Summarize all conversations into day memory
+            summaries_text = "\n".join(f"- {s}" for s in conv_summaries)
+            prompt = (
+                f"Here are all conversation summaries from {date_str}:\n\n{summaries_text}\n\n"
+                f"Summarize the entire day into {DAY_SUMMARY_MAX_SENTENCES} or fewer sentences. "
+                "Capture the most important events, topics, and outcomes. Output ONLY the summary."
+            )
+            day_summary = await self._call_groq(
+                prompt,
+                system="You create concise day summaries. Output ONLY the summary text.",
+                model=self.extraction_model,
+                temperature=0.3,
+            )
+
+            if day_summary:
+                full_day_summary = f"[{date_str}] {day_summary}"
+                await db.execute(
+                    "INSERT OR REPLACE INTO day_memories (date, summary) VALUES (?, ?)",
+                    (date_str, full_day_summary)
+                )
+                logger.info(f"Created day memory for {date_str}")
+
+            # Analyze episodic memories to create semantic memories
+            cursor = await db.execute(
+                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC LIMIT 50"
+            )
+            episodic_rows = await cursor.fetchall()
+
+            if episodic_rows:
+                episodic_text = "\n".join(f"[{r[0]}] {r[1]}" for r in episodic_rows)
+                sem_prompt = (
+                    f"Here are recent episodic memories:\n\n{episodic_text}\n\n"
+                    "Analyze these episodic memories and extract any general semantic knowledge "
+                    "(stable facts, user preferences, recurring patterns, biographical info). "
+                    "Only create semantic memories for things that are clearly established patterns or facts, not one-off events. "
+                    "It's okay to create none.\n\n"
+                    "Return a JSON array of strings (each is one semantic memory). "
+                    "Return [] if nothing qualifies. Output ONLY the JSON array."
+                )
+                sem_raw = await self._call_groq(
+                    sem_prompt,
+                    system="You analyze episodic memories to extract semantic knowledge. Output ONLY a JSON array.",
+                    model=self.extraction_model,
+                    temperature=0.3,
+                )
+
+                if sem_raw:
+                    try:
+                        sem_memories = json.loads(sem_raw)
+                        if isinstance(sem_memories, list):
+                            now = time.time()
+                            for mem in sem_memories:
+                                if isinstance(mem, str) and mem.strip():
+                                    await db.execute(
+                                        "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
+                                        (mem.strip(), now)
+                                    )
+                            if sem_memories:
+                                logger.info(f"Created {len(sem_memories)} semantic memories from episodic analysis")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Semantic memory extraction parse failed: {e}")
 
             await db.commit()
 
-    # ── Nightly Consolidation ───────────────────────────────
+    async def run_global_update(self):
+        """4:10 AM — Merge latest day memory into global memory."""
+        if not self.groq_client:
+            return
 
-    async def run_nightly_consolidation(self):
-        """Review weak memories and consolidate. Runs as a nightly cron job."""
+        yesterday = datetime.now(TIMEZONE) - timedelta(days=1)
+        date_str = yesterday.strftime("%Y-%m-%d")
+
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get latest day memory
+            cursor = await db.execute(
+                "SELECT summary FROM day_memories WHERE date = ?",
+                (date_str,)
+            )
+            day_row = await cursor.fetchone()
+            if not day_row:
+                logger.info("Global update: no day memory found for yesterday")
+                return
+
+            day_summary = day_row[0]
+
+            # Get current global memory
+            cursor = await db.execute(
+                "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
+            )
+            global_row = await cursor.fetchone()
+            current_global = global_row[0] if global_row else ""
+
+            # Merge
+            parts = []
+            if current_global:
+                parts.append(f"Current global memory:\n{current_global}")
+            parts.append(f"Latest day memory:\n{day_summary}")
+
+            prompt = (
+                "\n\n".join(parts) + "\n\n"
+                f"Merge the above into an updated global memory of {GLOBAL_SUMMARY_MAX_SENTENCES} or fewer sentences. "
+                "This should be a high-level overview of the most important ongoing context about the user, "
+                "their projects, preferences, and recent developments. Output ONLY the summary."
+            )
+            new_global = await self._call_groq(
+                prompt,
+                system="You maintain a concise global memory summary. Output ONLY the summary text.",
+                model=self.extraction_model,
+                temperature=0.3,
+            )
+
+            if new_global:
+                now = time.time()
+                if global_row:
+                    await db.execute(
+                        "UPDATE global_memory SET summary = ?, updated_at = ? WHERE id = (SELECT id FROM global_memory ORDER BY id DESC LIMIT 1)",
+                        (new_global, now)
+                    )
+                else:
+                    await db.execute(
+                        "INSERT INTO global_memory (summary, updated_at) VALUES (?, ?)",
+                        (new_global, now)
+                    )
+                await db.commit()
+                logger.info("Updated global memory")
+
+    async def run_weekly_cleanup(self):
+        """4:20 AM Sunday — Clean up episodic and semantic memories."""
         if not self.groq_client:
             return
 
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT id, type, title, content, strength
-                FROM memory_nodes
-                WHERE strength < 0.3 AND type NOT LIKE 'archived_%'
-                ORDER BY strength ASC
-                LIMIT 30
-            """)
-            weak_nodes = await cursor.fetchall()
+            # Get all episodic memories
+            cursor = await db.execute(
+                "SELECT id, content FROM episodic_memories ORDER BY created_at ASC"
+            )
+            episodic_rows = await cursor.fetchall()
 
-        if not weak_nodes:
-            logger.info("Nightly consolidation: no weak memories to review")
-            return
+            # Get all semantic memories
+            cursor = await db.execute(
+                "SELECT id, content FROM semantic_memories ORDER BY created_at ASC"
+            )
+            semantic_rows = await cursor.fetchall()
 
-        nodes_text = "\n".join(
-            f"[ID:{n[0]}] ({n[1]}) \"{n[2]}\" — {n[3]} (strength: {n[4]:.2f})"
-            for n in weak_nodes
-        )
+            if not episodic_rows and not semantic_rows:
+                logger.info("Weekly cleanup: no memories to review")
+                return
 
-        prompt = (
-            "Review these weak memories and decide what to do with each.\n"
-            "Return a JSON array of actions. Each item:\n"
-            '{"id": <node_id>, "action": "keep|archive|delete", "reason": "1 line"}\n\n'
-            "Rules:\n"
-            "- archive: memory is too vague or outdated to be useful\n"
-            "- delete: memory is completely irrelevant or superseded\n"
-            "- keep: memory is still potentially useful despite low strength\n\n"
-            f"Memories:\n{nodes_text}\n\nJSON array:"
-        )
+            parts = []
+            if episodic_rows:
+                episodic_text = "\n".join(f"[E{r[0]}] {r[1]}" for r in episodic_rows)
+                parts.append(f"Episodic memories:\n{episodic_text}")
+            if semantic_rows:
+                semantic_text = "\n".join(f"[S{r[0]}] {r[1]}" for r in semantic_rows)
+                parts.append(f"Semantic memories:\n{semantic_text}")
 
-        try:
-            response = self.groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You review and clean up AI memory. Output ONLY valid JSON arrays."},
-                    {"role": "user", "content": prompt}
-                ],
-                model=self.model_name,
+            prompt = (
+                "\n\n".join(parts) + "\n\n"
+                "Review all memories above. Identify:\n"
+                "1. Duplicate or near-duplicate memories (keep the better one, delete the rest)\n"
+                "2. Memories that are no longer relevant or have been superseded\n"
+                "3. Episodic memories that can be merged\n\n"
+                "Return JSON (no markdown):\n"
+                '{"delete_ids": ["E1", "S3", ...], "reason": "short explanation"}\n'
+                "If nothing needs cleanup, return: {\"delete_ids\": [], \"reason\": \"all clean\"}"
+            )
+            raw = await self._call_groq(
+                prompt,
+                system="You clean up AI memory by removing duplicates and stale entries. Output ONLY valid JSON.",
+                model=self.extraction_model,
                 temperature=0.2,
             )
-            raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-            if raw.startswith("```"):
-                raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                raw = re.sub(r'\s*```$', '', raw)
+
             if not raw:
                 return
 
-            actions = json.loads(raw)
-            if not isinstance(actions, list):
-                return
+            try:
+                data = json.loads(raw)
+                delete_ids = data.get("delete_ids", [])
+                if not isinstance(delete_ids, list):
+                    return
 
-            async with aiosqlite.connect(self.db_path) as db:
-                for action in actions:
-                    if not isinstance(action, dict):
+                for id_str in delete_ids:
+                    if not isinstance(id_str, str):
                         continue
-                    node_id = action.get("id")
-                    act = action.get("action", "keep")
-
-                    if act == "archive":
-                        await db.execute("""
-                            UPDATE memory_nodes SET type = 'archived_' || type
-                            WHERE id = ? AND type NOT LIKE 'archived_%'
-                        """, (node_id,))
-                    elif act == "delete":
-                        await db.execute("DELETE FROM memory_nodes WHERE id = ?", (node_id,))
-                        await db.execute("DELETE FROM memory_cues WHERE node_id = ?", (node_id,))
-                        await db.execute(
-                            "DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?",
-                            (node_id, node_id)
-                        )
+                    if id_str.startswith("E"):
+                        mem_id = int(id_str[1:])
+                        await db.execute("DELETE FROM episodic_memories WHERE id = ?", (mem_id,))
+                    elif id_str.startswith("S"):
+                        mem_id = int(id_str[1:])
+                        await db.execute("DELETE FROM semantic_memories WHERE id = ?", (mem_id,))
 
                 await db.commit()
-            logger.info(f"Nightly consolidation: processed {len(actions)} memories")
+                reason = data.get("reason", "")
+                logger.info(f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Weekly cleanup parse failed: {e}")
 
-        except Exception as e:
-            logger.error(f"Nightly consolidation failed: {e}")
+    # ── Recall Memory (Tool) ───────────────────────────────
+
+    async def recall_memory(self, query_type: str, date: str = "", time_range: str = "") -> str:
+        """Retrieve stored memories for the user.
+        query_type: 'conversation' | 'day' | 'global'
+        date: YYYY-MM-DD (required for 'conversation' and 'day')
+        time_range: HH:MM-HH:MM (required for 'conversation')
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if query_type == "global":
+                cursor = await db.execute(
+                    "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else "No global memory stored yet."
+
+            elif query_type == "day":
+                if not date:
+                    return "Error: date is required for day query (format: YYYY-MM-DD)"
+                cursor = await db.execute(
+                    "SELECT summary FROM day_memories WHERE date = ?",
+                    (date,)
+                )
+                row = await cursor.fetchone()
+                if row:
+                    return row[0]
+
+                # Fallback: get conversation summaries for that day
+                try:
+                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                    day_start = day_dt.timestamp()
+                    day_end = (day_dt + timedelta(days=1)).timestamp()
+                    cursor = await db.execute(
+                        "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                        (day_start, day_end)
+                    )
+                    rows = await cursor.fetchall()
+                    if rows:
+                        return "No day summary yet, but here are the conversation summaries:\n" + "\n".join(f"- {r[0]}" for r in rows)
+                except ValueError:
+                    return f"Invalid date format: {date}. Use YYYY-MM-DD."
+                return f"No memories found for {date}."
+
+            elif query_type == "conversation":
+                if not date or not time_range:
+                    return "Error: both date and time_range required for conversation query"
+                try:
+                    # Parse time range
+                    parts = time_range.split("-")
+                    if len(parts) != 2:
+                        return f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
+                    start_str, end_str = parts
+                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                    sh, sm = map(int, start_str.strip().split(":"))
+                    eh, em = map(int, end_str.strip().split(":"))
+                    range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
+                    range_end = day_dt.replace(hour=eh, minute=em).timestamp()
+
+                    cursor = await db.execute(
+                        "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                        (range_start, range_end)
+                    )
+                    rows = await cursor.fetchall()
+                    if rows:
+                        return "\n\n".join(r[0] for r in rows)
+                    return f"No conversations found in time range {time_range} on {date}."
+                except (ValueError, IndexError) as e:
+                    return f"Error parsing query: {e}"
+            else:
+                return f"Unknown query_type: {query_type}. Use 'global', 'day', or 'conversation'."
+
+    # ── Groq Helper ─────────────────────────────────────────
+
+    async def _call_groq(self, prompt: str, system: str, model: str, temperature: float = 0.3) -> Optional[str]:
+        """Call Groq API in a thread executor. Returns cleaned text or None."""
+        if not self.groq_client:
+            return None
+
+        def _sync_call():
+            try:
+                response = self.groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt}
+                    ],
+                    model=model,
+                    temperature=temperature,
+                )
+                raw = response.choices[0].message.content or ""
+                raw = raw.strip()
+                # Strip <think>...</think> blocks (qwen3 thinking)
+                raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                # Strip markdown code fences
+                if raw.startswith("```"):
+                    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = re.sub(r'\s*```$', '', raw)
+                return raw if raw else None
+            except Exception as e:
+                logger.error(f"Groq call failed ({model}): {e}")
+                return None
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync_call)
 
     # ── Utilities ───────────────────────────────────────────
 
-    async def clear_history(self):
+    async def clear_all(self):
         """Wipe everything — full memory reset."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM messages")
-            await db.execute("DELETE FROM memory_cues")
-            await db.execute("DELETE FROM memory_edges")
-            await db.execute("DELETE FROM memory_nodes")
+            await db.execute("DELETE FROM conversation_context")
+            await db.execute("DELETE FROM conversations")
+            await db.execute("DELETE FROM episodic_memories")
+            await db.execute("DELETE FROM semantic_memories")
+            await db.execute("DELETE FROM day_memories")
+            await db.execute("DELETE FROM global_memory")
             await db.commit()
