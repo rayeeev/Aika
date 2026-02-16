@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from collections import deque
+import functools
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -86,6 +88,12 @@ scheduled_jobs: Dict[str, str] = {}  # job_id -> thought
 # Track whether any side-effecting tool was called during the current generation cycle.
 # This prevents duplicate side-effects when retrying with a different API key.
 _tool_called_this_cycle = False
+
+# --- Message Buffering & Proactive State ---
+message_buffer: deque = deque()
+processing_task: Optional[asyncio.Task] = None
+input_lock = asyncio.Lock()
+last_interaction_ts = 0.0
 
 def _mark_tool_called():
     """Mark that a side-effecting tool has been invoked this generation cycle."""
@@ -338,6 +346,68 @@ async def wake_up_callback(thought: str):
         asyncio.create_task(_store_messages(f"[SELF-INITIATED] {thought}", "[CHOSE SILENCE]"))
 
 
+async def check_if_should_speak() -> None:
+    """
+    Proactive Layer: Checks if Aika should say something based on recent context.
+    Uses Groq (Llama 3.1 8b) for cheap, fast reasoning.
+    """
+    global last_interaction_ts
+    # Don't check if we just spoke very recently (prevent loops)
+    if (datetime.now().timestamp() - last_interaction_ts) < 5:
+        return
+
+    logger.info("Checking proactive layer...")
+    
+    # Get last few messages to decide
+    cc = await memory.get_conversation_context()
+    recent_msgs = cc["messages"][-6:] # Last 6 messages
+    if not recent_msgs:
+        return
+
+    history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in recent_msgs)
+
+    prompt = (
+        f"Here is the recent conversation history with Erden:\n\n{history_text}\n\n"
+        "You are Aika's subconscious. Decide if Aika should proactively say something distinct "
+        "to follow up, offer help, or react. "
+        "Aika JUST finished speaking (or the user just reacted). "
+        "Do NOT speak just to have the last word. Only speak if: \n"
+        "1. The user's last input implies a lingering unaddressed need.\n"
+        "2. Aika's last response was a dry fact and a friendly follow-up would check on the user.\n"
+        "3. The user reacted with an emoji that warrants a playful or caring response.\n\n"
+        "If NO speech is needed, output exactly `[NO]`.\n"
+        "If yes, output the thought/reasoning for speaking, e.g., 'Check if he needs more details on X'."
+    )
+
+    try:
+        completion = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.6,
+            )
+        )
+        result = completion.choices[0].message.content.strip()
+        
+        if "[NO]" in result:
+            logger.info("Proactive check: No.")
+            return
+
+        logger.info(f"Proactive check: YES -> {result}")
+        # Proceed to generate actual response based on this thought
+        # We inject this thought as a system prompt or "inner thought" trigger
+        response_text = await generate_response(f"[PROACTIVE THOUGHT]: {result}", is_self_initiated=True)
+        
+        if response_text and response_text.strip() != "[SILENCE]":
+            await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
+            asyncio.create_task(_store_messages(f"[PROACTIVE: {result}]", response_text))
+
+    except Exception as e:
+        logger.error(f"Proactive check failed: {e}")
+
+
+
 async def generate_response(user_text: str, is_self_initiated: bool = False) -> str:
     """Generates a response from Gemini, using conversation context and memories."""
 
@@ -458,10 +528,17 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
     global _tool_called_this_cycle
     _tool_called_this_cycle = False
 
+    loop = asyncio.get_running_loop()
+
     # Try each API key until one works
     last_error = None
     for i, gemini_client in enumerate(gemini_clients):
+        # Check cancellation before effective API call
+        if asyncio.current_task().cancelled():
+            raise asyncio.CancelledError()
+
         try:
+            # Create chat object (lightweight)
             chat = gemini_client.chats.create(
                 model="gemini-3-flash-preview",
                 config=genai_types.GenerateContentConfig(
@@ -475,20 +552,30 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
                 ),
                 history=chat_history
             )
-            response = chat.send_message(user_text)
+
+            # BLOCKING CALL FIX: Run send_message in thread executor
+            response = await loop.run_in_executor(
+                None,
+                lambda: chat.send_message(user_text)
+            )
+            
             text = response.text
             if text is None:
                 # AFC exhausted — chat history has tool results, ask model to wrap up
                 logger.warning("Gemini AFC exhausted. Asking model to summarize findings.")
                 try:
-                    followup = chat.send_message(
-                        "You hit your tool call limit. Summarize what you've found so far and ask Erden if he wants you to continue."
+                    followup = await loop.run_in_executor(
+                        None, 
+                        lambda: chat.send_message(
+                            "You hit your tool call limit. Summarize what you've found so far and ask Erden if he wants you to continue."
+                        )
                     )
                     return followup.text or "I gathered some info but couldn't finish. Want me to continue?"
                 except Exception:
                     return "I gathered some info but couldn't finish. Want me to continue?"
             return text
         except Exception as e:
+            # Retrieve the underlying exception if it's wrapped
             last_error = e
             logger.warning(f"Gemini API key {i + 1}/{len(gemini_clients)} failed: {e}")
             if _tool_called_this_cycle:
@@ -513,17 +600,46 @@ async def _keep_typing(chat_id: int):
         return
 
 
-async def process_user_input(message: Message, user_text: str, is_voice: bool = False):
+async def _process_buffered_messages(chat_id: int):
     """
-    Common handler for processing user input (text or transcribed voice).
-    Handles memory storage and response generation.
+    Consumes messages from buffer, debounces, and triggers generation.
+    If new messages arrive while waiting, the wait resets.
     """
-    stored_text = f"[VOICE] {user_text}" if is_voice else user_text
-
-    # Start resilient typing indicator in background
-    typing_task = asyncio.create_task(_keep_typing(message.chat.id))
+    global processing_task
+    
+    # Debounce wait
     try:
-        # Cap response generation at 90 seconds to prevent cascading delays
+        await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        return
+
+    # Combine messages
+    async with input_lock:
+        if not message_buffer:
+            return
+        
+        # Combine all buffered texts
+        combined_text = "\n\n".join(message_buffer)
+        message_buffer.clear()
+        
+    logger.info(f"Processing combined input: {combined_text[:50]}...")
+    
+    # Process the combined input
+    await process_combined_input(chat_id, combined_text)
+
+
+async def process_combined_input(chat_id: int, user_text: str):
+    """
+    Handles memory storage and response generation for combined input.
+    """
+    global last_interaction_ts
+    
+    # Start resilient typing indicator in background
+    typing_task = asyncio.create_task(_keep_typing(chat_id))
+    
+    response_text = None
+    try:
+        # Cap response generation at 90 seconds
         response_text = await asyncio.wait_for(
             generate_response(user_text),
             timeout=90.0
@@ -531,6 +647,11 @@ async def process_user_input(message: Message, user_text: str, is_voice: bool = 
     except asyncio.TimeoutError:
         logger.error("Response generation timed out after 90s")
         response_text = "Sorry, I'm having trouble reaching my brain right now. Try again in a moment?"
+    except asyncio.CancelledError:
+        logger.info("Generation cancelled due to new input.")
+        # We don't send anything if cancelled
+        typing_task.cancel()
+        return
     finally:
         typing_task.cancel()
         try:
@@ -540,13 +661,50 @@ async def process_user_input(message: Message, user_text: str, is_voice: bool = 
 
     if not response_text or response_text.strip() == "[SILENCE]":
         logger.info("Aika chose silence.")
-        # Store memory in background — don't block
-        asyncio.create_task(_store_messages(stored_text, "[CHOSE SILENCE]"))
+        asyncio.create_task(_store_messages(user_text, "[CHOSE SILENCE]"))
+        # Even if silence, we might want to check proactive? Maybe not.
         return
 
     # Reply IMMEDIATELY, then store memory in background
-    await message.reply(response_text)
-    asyncio.create_task(_store_messages(stored_text, response_text))
+    try:
+        await bot.send_message(chat_id=chat_id, text=response_text)
+        last_interaction_ts = datetime.now().timestamp()
+        asyncio.create_task(_store_messages(user_text, response_text))
+        
+        # Trigger proactive check after answering
+        asyncio.create_task(check_if_should_speak())
+        
+    except Exception as e:
+        logger.error(f"Failed to send response: {e}")
+
+
+async def handle_new_input(message: Message, text: str):
+    """
+    Main entry point for user text input.
+    - Cancels current generation if active.
+    - Buffers new message.
+    - Starts/Restarts debounce timer.
+    """
+    global processing_task
+    
+    async with input_lock:
+        # If we are currently GENERATING (processing_task is running AND not in debounce), 
+        # we strictly should cancel it to "rerun with both prompts".
+        # However, processing_task currently includes the debounce wait.
+        
+        if processing_task and not processing_task.done():
+            processing_task.cancel()
+            try:
+                await processing_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Cancelled previous processing task to accumulate new input.")
+
+        # Buffer the new text
+        message_buffer.append(text)
+        
+        # Start new processing task (starts with debounce)
+        processing_task = asyncio.create_task(_process_buffered_messages(message.chat.id))
 
 
 @dp.message(F.voice)
@@ -573,7 +731,8 @@ async def handle_voice_message(message: Message):
         logger.info(f"Transcribed voice message: {transcription}")
         await processing_msg.delete()
 
-        await process_user_input(message, transcription, is_voice=True)
+        # Treat voice as text input for buffering logic
+        await handle_new_input(message, f"[VOICE] {transcription}")
 
     except Exception as e:
         logger.error(f"Error processing voice message: {e}")
@@ -597,7 +756,40 @@ async def handle_text_message(message: Message):
         return
 
     logger.info(f"Received: {user_text}")
-    await process_user_input(message, user_text, is_voice=False)
+    await handle_new_input(message, user_text)
+
+
+@dp.message_reaction()
+async def handle_reaction(message_reaction: types.MessageReactionUpdated):
+    """
+    Handle emoji reactions.
+    - Saves directly to memory (no Groq extraction).
+    - Triggers proactive check.
+    """
+    if message_reaction.user.id != ALLOWED_USER_ID:
+        return
+        
+    # Get the new reaction (last one added)
+    new_reactions = message_reaction.new_reaction
+    if not new_reactions:
+        return # Reaction removed
+
+    # Using the first reaction in the list for simplicity
+    reaction = new_reactions[-1]
+    emoji = reaction.emoji if hasattr(reaction, 'emoji') else "content"
+    
+    logger.info(f"Received reaction: {emoji}")
+    
+    # Direct Save to Memory (Fast Track)
+    # We store it as a 'user' message but clearly marked
+    content = f"[USER REACTION: {emoji}]"
+    try:
+        await memory.add_message("user", content)
+    except Exception as e:
+        logger.error(f"Failed to save reaction: {e}")
+        
+    # Trigger Proactive Check
+    asyncio.create_task(check_if_should_speak())
 
 
 @dp.message()
