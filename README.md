@@ -17,7 +17,7 @@ Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegra
 Aika uses a **conversation-centric memory system** with multiple layers of consolidation.
 
 ```
-┌────────────────────────────────────────────────────-─┐
+┌──────────────────────────────────────────────────────┐
 │              CONTEXT COMPOSER                        │
 │         (Assembled before each Gemini call)          │
 │                                                      │
@@ -29,25 +29,25 @@ Aika uses a **conversation-centric memory system** with multiple layers of conso
 └──────────────┬───────────────────────────────────────┘
                │
                ▼
-┌──────────────────────────────────────────────────--───┐
-│           CONVERSATION LAYER                          │
-│                                                       │
-│  Immediate Buffer: last 10 interactions (20 msgs)     │
-│  CC Summary: ≤3 sentence rolling summary of older     │
-│  messages in the same conversation                    │
-│                                                       │
-│  30-min gap → close conversation → summarize + extract│
-└──────────────┬────────────────────────────────────-───┘
+┌────────────────────────────────────────────────────────┐
+│           CONVERSATION LAYER                           │
+│                                                        │
+│  Immediate Buffer: last 10 interactions (20 msgs)      │
+│  CC Summary: ≤3 sentence rolling summary of older      │
+│  messages in the same conversation                     │
+│                                                        │
+│  30-min gap → close conversation → summarize + extract │
+└──────────────┬─────────────────────────────────────────┘
                │
                ▼
-┌─────────────────────────────────────────────────────┐
-│           MEMORY LAYERS                             │
-│                                                     │
-│  📅 Episodic  — extracted when conversations close   │
-│  💡 Semantic  — distilled from episodic at 4:00 AM   │
-│  📋 Day Memory — 3-sentence summary of each day      │
-│  🌐 Global Memory — 4-sentence rolling overview      │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│           MEMORY LAYERS                                                   │
+│                                                                           │
+│  📅 Episodic  — extracted when conversations close (~4000 token budget)   │
+│  💡 Semantic  — distilled from episodic at 4:00 AM (~300 token budget)    │
+│  📋 Day Memory — 3-sentence summary of each day                           │
+│  🌐 Global Memory — 4-sentence rolling overview                           │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Lifecycle
@@ -192,6 +192,9 @@ Aika/
 | `schedule_wake_up(seconds, thought)` | Schedule self-initiated check-in |
 | `read_server_logs(lines)` | Read Aika's own server logs |
 | `recall_memory(query_type, date, time_range)` | Retrieve global/day/conversation memories |
+| `list_memories(memory_type)` | List episodic or semantic memories with IDs |
+| `delete_memory(memory_type, memory_id)` | Delete a specific memory by type and ID |
+| `edit_memory(memory_type, memory_id, new_content)` | Edit a specific memory's content |
 
 ## 🔒 Security
 

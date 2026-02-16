@@ -13,7 +13,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message
-from aiogram.utils.chat_action import ChatActionSender
+# ChatActionSender removed — replaced with resilient _keep_typing background task
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from google import genai
@@ -83,6 +83,15 @@ memory.set_groq_client(groq_client)
 # Track scheduled wake-up jobs
 scheduled_jobs: Dict[str, str] = {}  # job_id -> thought
 
+# Track whether any side-effecting tool was called during the current generation cycle.
+# This prevents duplicate side-effects when retrying with a different API key.
+_tool_called_this_cycle = False
+
+def _mark_tool_called():
+    """Mark that a side-effecting tool has been invoked this generation cycle."""
+    global _tool_called_this_cycle
+    _tool_called_this_cycle = True
+
 # Initialize Gemini Clients for each API key
 gemini_clients: List[genai.Client] = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
 
@@ -110,7 +119,7 @@ async def transcribe_audio(file_path: Path) -> Optional[str]:
             logger.error(f"Transcription error: {e}", exc_info=True)
             return None
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _transcribe)
 
 
@@ -155,6 +164,7 @@ async def cleanup_audio_file(file_path: Path):
 
 def execute_shell_command(cmd: str) -> str:
     """Executes a shell command on the Raspberry Pi."""
+    _mark_tool_called()
     import subprocess
     try:
         result = subprocess.run(
@@ -186,6 +196,7 @@ def read_file(path: str) -> str:
 
 def write_file(path: str, content: str) -> str:
     """Writes content to a file."""
+    _mark_tool_called()
     try:
         abs_path = os.path.abspath(path)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -212,6 +223,7 @@ def schedule_wake_up(seconds_from_now: int, thought: str) -> str:
     seconds_from_now: Integer seconds to wait (must be positive).
     thought: The thought or prompt to start with when waking up.
     """
+    _mark_tool_called()
     if seconds_from_now <= 0:
         return f"Error: seconds_from_now must be positive, got {seconds_from_now}"
 
@@ -247,12 +259,39 @@ def recall_memory(query_type: str, date: str = "", time_range: str = "") -> str:
     - User gave a specific day only → query_type="day", date="YYYY-MM-DD"
     - User asked about memory with no specifics → query_type="global"
     """
-    return asyncio.get_event_loop().run_until_complete(
-        memory.recall_memory(query_type, date, time_range)
-    )
+    return memory.recall_memory_sync(query_type, date, time_range)
 
 
-tools_list = [execute_shell_command, read_file, write_file, list_directory, schedule_wake_up, read_server_logs, recall_memory]
+def list_memories(memory_type: str) -> str:
+    """
+    List all memories of a given type with their IDs.
+    memory_type: 'episodic' or 'semantic'
+    """
+    return memory.list_memories_sync(memory_type)
+
+
+def delete_memory(memory_type: str, memory_id: int) -> str:
+    """
+    Delete a specific memory by type and ID.
+    memory_type: 'episodic' or 'semantic'
+    memory_id: Integer ID of the memory (shown as E<id> or S<id> in list_memories output)
+    """
+    _mark_tool_called()
+    return memory.delete_memory_sync(memory_type, memory_id)
+
+
+def edit_memory(memory_type: str, memory_id: int, new_content: str) -> str:
+    """
+    Edit the content of a specific memory.
+    memory_type: 'episodic' or 'semantic'
+    memory_id: Integer ID of the memory (shown as E<id> or S<id> in list_memories output)
+    new_content: The new content to replace the old memory with
+    """
+    _mark_tool_called()
+    return memory.edit_memory_sync(memory_type, memory_id, new_content)
+
+
+tools_list = [execute_shell_command, read_file, write_file, list_directory, schedule_wake_up, read_server_logs, recall_memory, list_memories, delete_memory, edit_memory]
 
 
 # --- Helper ---
@@ -351,13 +390,18 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         "   - User gave time interval AND day → query_type='conversation', date='YYYY-MM-DD', time_range='HH:MM-HH:MM'\n"
         "   - User gave a day → query_type='day', date='YYYY-MM-DD'\n"
         "   - User asked about memory in general → query_type='global'\n\n"
+        "7. Memory management (list_memories, delete_memory, edit_memory): Use ONLY when Erden explicitly asks to see, delete, or edit specific memories.\n"
+        "   - First call list_memories to show what's stored, then delete_memory or edit_memory as requested.\n\n"
         "=== AVAILABLE TOOLS (use sparingly) ===\n"
         "- execute_shell_command: Run shell commands. Combine multiple commands with && or ;\n"
         "- read_file / write_file: Read or write files\n"
         "- list_directory: List directory contents\n"
         "- schedule_wake_up: Schedule a self-initiated wake-up for reminders or delayed tasks\n"
         "- read_server_logs: Read your own server logs (for debugging only)\n"
-        "- recall_memory: Retrieve stored global/day/conversation memories (for explicit user requests only)\n\n"
+        "- recall_memory: Retrieve stored global/day/conversation memories (for explicit user requests only)\n"
+        "- list_memories: List episodic or semantic memories with IDs (when asked to view/manage memories)\n"
+        "- delete_memory: Delete a specific memory by type (episodic/semantic) and ID\n"
+        "- edit_memory: Edit a specific memory's content by type and ID\n\n"
         "=== TIME AWARENESS ===\n"
         f"Current Time: {now_str}\n"
         "Messages in your history may contain [TIME GAP: ...] markers showing elapsed time between interactions. "
@@ -410,6 +454,10 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
             parts=[genai_types.Part(text=content)]
         ))
 
+    # Reset tool tracking for this generation cycle
+    global _tool_called_this_cycle
+    _tool_called_this_cycle = False
+
     # Try each API key until one works
     last_error = None
     for i, gemini_client in enumerate(gemini_clients):
@@ -443,10 +491,26 @@ async def generate_response(user_text: str, is_self_initiated: bool = False) -> 
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini API key {i + 1}/{len(gemini_clients)} failed: {e}")
+            if _tool_called_this_cycle:
+                logger.error("Tool calls were already executed — cannot safely retry with another key.")
+                return "I ran into an API error after already executing some actions. Please check what was done and ask me to continue if needed."
             continue
 
     logger.error(f"All {len(gemini_clients)} Gemini API keys exhausted. Last error: {last_error}")
     return "All API keys are exhausted. Please try again later."
+
+
+async def _keep_typing(chat_id: int):
+    """Send typing indicator every 5 seconds, suppressing network errors."""
+    try:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                pass  # Network timeout is fine, just keep trying
+            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        return
 
 
 async def process_user_input(message: Message, user_text: str, is_voice: bool = False):
@@ -456,9 +520,23 @@ async def process_user_input(message: Message, user_text: str, is_voice: bool = 
     """
     stored_text = f"[VOICE] {user_text}" if is_voice else user_text
 
-    # Show "typing..." indicator while Gemini is thinking
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        response_text = await generate_response(user_text)
+    # Start resilient typing indicator in background
+    typing_task = asyncio.create_task(_keep_typing(message.chat.id))
+    try:
+        # Cap response generation at 90 seconds to prevent cascading delays
+        response_text = await asyncio.wait_for(
+            generate_response(user_text),
+            timeout=90.0
+        )
+    except asyncio.TimeoutError:
+        logger.error("Response generation timed out after 90s")
+        response_text = "Sorry, I'm having trouble reaching my brain right now. Try again in a moment?"
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
     if not response_text or response_text.strip() == "[SILENCE]":
         logger.info("Aika chose silence.")

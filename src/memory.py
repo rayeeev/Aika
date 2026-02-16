@@ -4,6 +4,7 @@ import json
 import re
 import time
 import os
+import threading
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
@@ -22,6 +23,8 @@ CC_SUMMARY_MAX_SENTENCES = 3
 CONVERSATION_SUMMARY_MAX_SENTENCES = 4
 DAY_SUMMARY_MAX_SENTENCES = 3
 GLOBAL_SUMMARY_MAX_SENTENCES = 4
+MAX_EPISODIC_TOKENS = 4000    # Token budget for all episodic memories combined
+MAX_SEMANTIC_TOKENS = 1500    # Token budget for all semantic memories combined
 
 
 class Memory:
@@ -31,6 +34,7 @@ class Memory:
         self.extraction_model = "qwen/qwen3-32b"
         self.filter_model = "llama-3.1-8b-instant"
         self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()  # For sync tool methods (Gemini AFC)
 
     def set_groq_client(self, client: Groq):
         self.groq_client = client
@@ -39,6 +43,8 @@ class Memory:
 
     async def init_db(self):
         async with aiosqlite.connect(self.db_path) as db:
+            # Enable WAL mode for concurrent read/write safety
+            await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,17 +210,19 @@ class Memory:
                 (new_summary, time.time(), conv_id)
             )
 
-        # Delete the overflowed messages from the buffer
-        cursor = await db.execute(
-            "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-            (conv_id, overflow_count)
-        )
-        ids_to_delete = [r[0] for r in await cursor.fetchall()]
-        if ids_to_delete:
-            placeholders = ",".join(["?"] * len(ids_to_delete))
-            await db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete)
+            # Only delete overflow messages if summarization succeeded
+            cursor = await db.execute(
+                "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+                (conv_id, overflow_count)
+            )
+            ids_to_delete = [r[0] for r in await cursor.fetchall()]
+            if ids_to_delete:
+                placeholders = ",".join(["?"] * len(ids_to_delete))
+                await db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete)
 
-        await db.commit()
+            await db.commit()
+        else:
+            logger.warning(f"CC summarization failed for conversation {conv_id} — overflow messages preserved")
 
     async def _summarize_cc(self, current_summary: str, new_messages: str) -> Optional[str]:
         """Use Groq to fold new messages into the CC summary (max 3 sentences)."""
@@ -299,11 +307,128 @@ class Memory:
                 (mem, conv_id, now)
             )
 
+        await self._enforce_memory_limits(db)
         await db.commit()
         logger.info(f"Closed conversation {conv_id}: {len(episodic_memories)} episodic memories extracted")
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~4 chars per token for English text."""
+        return max(1, len(text) // 4)
+
+    async def _enforce_memory_limits(self, db):
+        """Consolidate memories via Groq if total tokens exceed budget."""
+        await self._consolidate_table(db, "episodic_memories", MAX_EPISODIC_TOKENS, "episodic")
+        await self._consolidate_table(db, "semantic_memories", MAX_SEMANTIC_TOKENS, "semantic")
+
+    async def _consolidate_table(self, db, table: str, token_budget: int, label: str):
+        """Check a memory table's token usage; if over budget, ask Groq to consolidate."""
+        cursor = await db.execute(f"SELECT id, content FROM {table} ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+
+        total_tokens = sum(self._estimate_tokens(r[1]) for r in rows)
+        if total_tokens <= token_budget:
+            return
+
+        logger.info(f"{label} memories over token budget ({total_tokens}/{token_budget}). Consolidating...")
+
+        if not self.groq_client:
+            # No Groq → fall back to deleting oldest until under budget
+            running = total_tokens
+            for id_, content in reversed(rows):  # oldest last in DESC order, so reversed = oldest first
+                if running <= token_budget:
+                    break
+                running -= self._estimate_tokens(content)
+                await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
+            logger.info(f"Pruned {label} memories to ~{running} tokens (no Groq, oldest-first fallback)")
+            return
+
+        # Build memories text for Groq
+        memories_text = "\n".join(f"[{r[0]}] {r[1]}" for r in rows)
+        prompt = (
+            f"Here are all {label} memories (currently ~{total_tokens} tokens, budget is {token_budget} tokens):\n\n"
+            f"{memories_text}\n\n"
+            f"Consolidate these to fit within ~{token_budget} tokens. You can:\n"
+            "1. Remove memories that are redundant, outdated, or low-value\n"
+            "2. Merge similar memories into shorter combined ones\n"
+            "3. Summarize verbose memories more concisely\n\n"
+            "Return JSON (no markdown):\n"
+            '{"keep": [id1, id2, ...], "delete": [id3, id4, ...], '
+            '"update": {"id": new_content, ...}, '
+            '"add": ["new merged memory 1", ...]}\n\n'
+            "- 'keep': IDs to keep as-is\n"
+            "- 'delete': IDs to remove\n"
+            "- 'update': IDs whose content should be replaced with a shorter version\n"
+            "- 'add': brand new memories created by merging deleted ones (optional)\n"
+            "The resulting set must fit within the token budget."
+        )
+
+        data = await self._call_groq_json(
+            prompt,
+            system=f"You consolidate AI {label} memories to fit a token budget. Output ONLY valid JSON.",
+            model=self.extraction_model,
+            temperature=0.2,
+        )
+
+        if data is None:
+            # Fallback: delete oldest
+            running = total_tokens
+            for id_, content in reversed(rows):
+                if running <= token_budget:
+                    break
+                running -= self._estimate_tokens(content)
+                await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
+            logger.info(f"Pruned {label} memories to ~{running} tokens (Groq failed, oldest-first fallback)")
+            return
+
+        try:
+            # Process deletes
+            for mem_id in data.get("delete", []):
+                await db.execute(f"DELETE FROM {table} WHERE id = ?", (int(mem_id),))
+
+            # Process updates (rewrite shorter)
+            for mem_id_str, new_content in data.get("update", {}).items():
+                await db.execute(
+                    f"UPDATE {table} SET content = ? WHERE id = ?",
+                    (str(new_content), int(mem_id_str))
+                )
+
+            # Process adds (merged memories)
+            import time as _time
+            now = _time.time()
+            for new_mem in data.get("add", []):
+                if isinstance(new_mem, str) and new_mem.strip():
+                    if table == "episodic_memories":
+                        await db.execute(
+                            "INSERT INTO episodic_memories (content, conversation_id, created_at) VALUES (?, NULL, ?)",
+                            (new_mem.strip(), now)
+                        )
+                    else:
+                        await db.execute(
+                            "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
+                            (new_mem.strip(), now)
+                        )
+
+            deleted = len(data.get('delete', []))
+            updated = len(data.get('update', {}))
+            added = len(data.get('add', []))
+            logger.info(f"Consolidated {label} memories: {deleted} deleted, {updated} updated, {added} added")
+
+        except (ValueError, KeyError) as e:
+            logger.error(f"{label} memory consolidation processing failed: {e}")
+            # Fallback: delete oldest
+            running = total_tokens
+            for id_, content in reversed(rows):
+                if running <= token_budget:
+                    break
+                running -= self._estimate_tokens(content)
+                await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
+            logger.info(f"Pruned {label} memories to ~{running} tokens (processing fallback)")
+
     async def _extract_conversation_close(self, full_text: str, time_interval: str) -> tuple:
-        """Extract conversation summary + episodic memories via Groq."""
+        """Extract conversation summary + episodic memories via Groq with retry."""
         if not self.groq_client:
             return (f"[{time_interval}] (no summary available)", [])
 
@@ -318,27 +443,22 @@ class Memory:
             '{"summary": "...", "episodic": ["memory1", "memory2", ...]}\n'
         )
 
-        raw = await self._call_groq(
-            prompt,
-            system="You extract conversation summaries and episodic memories. Output ONLY valid JSON.",
-            model=self.extraction_model,
-            temperature=0.3,
+        system_msg = "You extract conversation summaries and episodic memories. Output ONLY valid JSON."
+
+        data = await self._call_groq_json(
+            prompt, system=system_msg, model=self.extraction_model, temperature=0.3
         )
 
-        if not raw:
+        if data is None:
+            logger.error(f"Conversation close extraction fully failed for {time_interval}")
             return (f"[{time_interval}] (extraction failed)", [])
 
-        try:
-            data = json.loads(raw)
-            summary = f"[{time_interval}] {data.get('summary', '(no summary)')}"
-            episodic = data.get("episodic", [])
-            if not isinstance(episodic, list):
-                episodic = []
-            episodic = [str(e) for e in episodic if e]
-            return (summary, episodic)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.error(f"Conversation close extraction parse failed: {e}")
-            return (f"[{time_interval}] (parse failed)", [])
+        summary = f"[{time_interval}] {data.get('summary', '(no summary)')}"
+        episodic = data.get("episodic", [])
+        if not isinstance(episodic, list):
+            episodic = []
+        episodic = [str(e) for e in episodic if e]
+        return (summary, episodic)
 
     async def close_stale_conversations(self):
         """Called periodically (e.g. every 5 min) to close conversations
@@ -361,27 +481,28 @@ class Memory:
         """Returns the CC for the active conversation:
         {"summary": str, "messages": [{"role": ..., "content": ..., "timestamp": ...}]}
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            conv_id = await self._get_active_conversation(db)
-            if conv_id is None:
-                return {"summary": "", "messages": []}
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                conv_id = await self._get_active_conversation(db)
+                if conv_id is None:
+                    return {"summary": "", "messages": []}
 
-            # Get CC summary
-            cursor = await db.execute(
-                "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-                (conv_id,)
-            )
-            row = await cursor.fetchone()
-            summary = row[0] if row and row[0] else ""
+                # Get CC summary
+                cursor = await db.execute(
+                    "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+                    (conv_id,)
+                )
+                row = await cursor.fetchone()
+                summary = row[0] if row and row[0] else ""
 
-            # Get buffered messages (the immediate buffer)
-            cursor = await db.execute(
-                "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
-                (conv_id,)
-            )
-            messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in await cursor.fetchall()]
+                # Get buffered messages (the immediate buffer)
+                cursor = await db.execute(
+                    "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+                    (conv_id,)
+                )
+                messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in await cursor.fetchall()]
 
-            return {"summary": summary, "messages": messages}
+                return {"summary": summary, "messages": messages}
 
     async def get_today_conversation_summaries(self) -> str:
         """Get summaries of all closed conversations from today."""
@@ -425,7 +546,7 @@ class Memory:
 
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC LIMIT 100"
+                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC"
             )
             rows = await cursor.fetchall()
 
@@ -442,29 +563,25 @@ class Memory:
             "If none are relevant, return []. Output ONLY the JSON array."
         )
 
-        raw = await self._call_groq(
+        data = await self._call_groq_json(
             prompt,
             system="You filter memories for relevance. Output ONLY a JSON array of IDs.",
             model=self.filter_model,
             temperature=0.1,
         )
 
-        if not raw:
+        if data is None:
             return "(Memory filter unavailable)"
 
-        try:
-            ids = json.loads(raw)
-            if not isinstance(ids, list) or not ids:
-                return "(No relevant episodic memories)"
+        if not isinstance(data, list) or not data:
+            return "(No relevant episodic memories)"
 
-            # Fetch the relevant ones
-            relevant = [r[1] for r in rows if r[0] in ids]
-            if not relevant:
-                return "(No relevant episodic memories)"
+        # Fetch the relevant ones
+        relevant = [r[1] for r in rows if r[0] in data]
+        if not relevant:
+            return "(No relevant episodic memories)"
 
-            return "\n".join(f"• {m}" for m in relevant)
-        except (json.JSONDecodeError, Exception):
-            return "(Memory filter error)"
+        return "\n".join(f"• {m}" for m in relevant)
 
     # ── Scheduled Jobs ──────────────────────────────────────
 
@@ -520,40 +637,47 @@ class Memory:
             )
             episodic_rows = await cursor.fetchall()
 
+            # Fetch existing semantic memories for dedup
+            cursor = await db.execute(
+                "SELECT content FROM semantic_memories ORDER BY created_at DESC"
+            )
+            existing_semantic = [r[0] for r in await cursor.fetchall()]
+
             if episodic_rows:
                 episodic_text = "\n".join(f"[{r[0]}] {r[1]}" for r in episodic_rows)
+                existing_text = "\n".join(f"• {s}" for s in existing_semantic) if existing_semantic else "(none)"
                 sem_prompt = (
                     f"Here are recent episodic memories:\n\n{episodic_text}\n\n"
-                    "Analyze these episodic memories and extract any general semantic knowledge "
-                    "(stable facts, user preferences, recurring patterns, biographical info). "
+                    f"Here are EXISTING semantic memories (DO NOT duplicate these):\n{existing_text}\n\n"
+                    "Analyze the episodic memories and extract any NEW general semantic knowledge "
+                    "(stable facts, user preferences, recurring patterns, biographical info) "
+                    "that is NOT already captured in existing semantic memories. "
                     "Only create semantic memories for things that are clearly established patterns or facts, not one-off events. "
-                    "It's okay to create none.\n\n"
-                    "Return a JSON array of strings (each is one semantic memory). "
+                    "It's OK to return none if nothing new qualifies.\n\n"
+                    "Return a JSON array of strings (each is one NEW semantic memory). "
                     "Return [] if nothing qualifies. Output ONLY the JSON array."
                 )
-                sem_raw = await self._call_groq(
+                sem_data = await self._call_groq_json(
                     sem_prompt,
                     system="You analyze episodic memories to extract semantic knowledge. Output ONLY a JSON array.",
                     model=self.extraction_model,
                     temperature=0.3,
                 )
 
-                if sem_raw:
-                    try:
-                        sem_memories = json.loads(sem_raw)
-                        if isinstance(sem_memories, list):
-                            now = time.time()
-                            for mem in sem_memories:
-                                if isinstance(mem, str) and mem.strip():
-                                    await db.execute(
-                                        "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
-                                        (mem.strip(), now)
-                                    )
-                            if sem_memories:
-                                logger.info(f"Created {len(sem_memories)} semantic memories from episodic analysis")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Semantic memory extraction parse failed: {e}")
+                if sem_data is not None and isinstance(sem_data, list):
+                    now = time.time()
+                    count = 0
+                    for mem in sem_data:
+                        if isinstance(mem, str) and mem.strip():
+                            await db.execute(
+                                "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
+                                (mem.strip(), now)
+                            )
+                            count += 1
+                    if count:
+                        logger.info(f"Created {count} semantic memories from episodic analysis")
 
+            await self._enforce_memory_limits(db)
             await db.commit()
 
     async def run_global_update(self):
@@ -658,37 +782,39 @@ class Memory:
                 '{"delete_ids": ["E1", "S3", ...], "reason": "short explanation"}\n'
                 "If nothing needs cleanup, return: {\"delete_ids\": [], \"reason\": \"all clean\"}"
             )
-            raw = await self._call_groq(
+            data = await self._call_groq_json(
                 prompt,
                 system="You clean up AI memory by removing duplicates and stale entries. Output ONLY valid JSON.",
                 model=self.extraction_model,
                 temperature=0.2,
             )
 
-            if not raw:
+            if data is None:
                 return
 
-            try:
-                data = json.loads(raw)
-                delete_ids = data.get("delete_ids", [])
-                if not isinstance(delete_ids, list):
-                    return
+            delete_ids = data.get("delete_ids", [])
+            if not isinstance(delete_ids, list):
+                return
 
-                for id_str in delete_ids:
-                    if not isinstance(id_str, str):
-                        continue
-                    if id_str.startswith("E"):
+            for id_str in delete_ids:
+                if not isinstance(id_str, str):
+                    continue
+                if id_str.startswith("E"):
+                    try:
                         mem_id = int(id_str[1:])
                         await db.execute("DELETE FROM episodic_memories WHERE id = ?", (mem_id,))
-                    elif id_str.startswith("S"):
+                    except ValueError:
+                        continue
+                elif id_str.startswith("S"):
+                    try:
                         mem_id = int(id_str[1:])
                         await db.execute("DELETE FROM semantic_memories WHERE id = ?", (mem_id,))
+                    except ValueError:
+                        continue
 
-                await db.commit()
-                reason = data.get("reason", "")
-                logger.info(f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}")
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Weekly cleanup parse failed: {e}")
+            await db.commit()
+            reason = data.get("reason", "")
+            logger.info(f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}")
 
     # ── Recall Memory (Tool) ───────────────────────────────
 
@@ -761,7 +887,7 @@ class Memory:
             else:
                 return f"Unknown query_type: {query_type}. Use 'global', 'day', or 'conversation'."
 
-    # ── Groq Helper ─────────────────────────────────────────
+    # ── Groq Helpers ────────────────────────────────────────
 
     async def _call_groq(self, prompt: str, system: str, model: str, temperature: float = 0.3) -> Optional[str]:
         """Call Groq API in a thread executor. Returns cleaned text or None."""
@@ -791,8 +917,91 @@ class Memory:
                 logger.error(f"Groq call failed ({model}): {e}")
                 return None
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _sync_call)
+
+    async def _call_groq_json(self, prompt: str, system: str, model: str,
+                              temperature: float = 0.3, max_retries: int = 2) -> Optional[Any]:
+        """Call Groq and parse as JSON, with retry on parse failure.
+        On failure, feeds the error back to Groq so it can correct its output.
+        Returns parsed JSON (dict or list) or None after all retries exhausted."""
+        if not self.groq_client:
+            return None
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+
+        for attempt in range(1 + max_retries):
+            def _sync_call(msgs=messages[:]):
+                try:
+                    response = self.groq_client.chat.completions.create(
+                        messages=msgs,
+                        model=model,
+                        temperature=temperature,
+                    )
+                    raw = response.choices[0].message.content or ""
+                    raw = raw.strip()
+                    # Strip <think>...</think> blocks (qwen3 thinking)
+                    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                    # Strip markdown code fences
+                    if raw.startswith("```"):
+                        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                        raw = re.sub(r'\s*```$', '', raw)
+                    return raw if raw else None
+                except Exception as e:
+                    logger.error(f"Groq JSON call failed ({model}, attempt {attempt + 1}): {e}")
+                    return None
+
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(None, _sync_call)
+
+            if raw is None:
+                if attempt < max_retries:
+                    logger.warning(f"Groq returned empty response (attempt {attempt + 1}/{1 + max_retries}), retrying...")
+                    # Add error feedback for retry (use placeholder, not empty string)
+                    messages.append({"role": "assistant", "content": "(empty response)"})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous response was EMPTY. I need valid JSON output. "
+                            "Please try again and return ONLY valid JSON, no markdown, no explanation."
+                        )
+                    })
+                    continue
+                logger.error(f"Groq returned empty response after {1 + max_retries} attempts")
+                return None
+
+            try:
+                data = json.loads(raw)
+                if attempt > 0:
+                    logger.info(f"Groq JSON succeeded on retry attempt {attempt + 1}")
+                return data
+            except json.JSONDecodeError as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Groq JSON parse failed (attempt {attempt + 1}/{1 + max_retries}): {e}. "
+                        f"Raw response (first 200 chars): {raw[:200]}"
+                    )
+                    # Feed the error back to Groq so it can fix its output
+                    messages.append({"role": "assistant", "content": raw[:500]})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Your response is NOT valid JSON. Parse error: {e}\n"
+                            "Please fix your output and return ONLY valid JSON. "
+                            "No markdown code fences, no explanation, no text before or after the JSON."
+                        )
+                    })
+                else:
+                    logger.error(
+                        f"Groq JSON parse failed after {1 + max_retries} attempts. "
+                        f"Last error: {e}. Last raw (first 200 chars): {raw[:200]}"
+                    )
+                    return None
+
+        return None
 
     # ── Utilities ───────────────────────────────────────────
 
@@ -807,3 +1016,148 @@ class Memory:
             await db.execute("DELETE FROM day_memories")
             await db.execute("DELETE FROM global_memory")
             await db.commit()
+
+    # ── Sync Methods (for Gemini AFC tools) ────────────────
+
+    def recall_memory_sync(self, query_type: str, date: str = "", time_range: str = "") -> str:
+        """Sync version of recall_memory — uses plain sqlite3 so it's safe inside AFC."""
+        import sqlite3
+        with self._sync_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if query_type == "global":
+                    row = conn.execute(
+                        "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    return row[0] if row else "No global memory stored yet."
+
+                elif query_type == "day":
+                    if not date:
+                        return "Error: date is required for day query (format: YYYY-MM-DD)"
+                    row = conn.execute(
+                        "SELECT summary FROM day_memories WHERE date = ?", (date,)
+                    ).fetchone()
+                    if row:
+                        return row[0]
+                    try:
+                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                        day_start = day_dt.timestamp()
+                        day_end = (day_dt + timedelta(days=1)).timestamp()
+                        rows = conn.execute(
+                            "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                            (day_start, day_end)
+                        ).fetchall()
+                        if rows:
+                            return "No day summary yet, but here are the conversation summaries:\n" + "\n".join(f"- {r[0]}" for r in rows)
+                    except ValueError:
+                        return f"Invalid date format: {date}. Use YYYY-MM-DD."
+                    return f"No memories found for {date}."
+
+                elif query_type == "conversation":
+                    if not date or not time_range:
+                        return "Error: both date and time_range required for conversation query"
+                    try:
+                        parts = time_range.split("-")
+                        if len(parts) != 2:
+                            return f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
+                        start_str, end_str = parts
+                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                        sh, sm = map(int, start_str.strip().split(":"))
+                        eh, em = map(int, end_str.strip().split(":"))
+                        range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
+                        range_end = day_dt.replace(hour=eh, minute=em).timestamp()
+                        rows = conn.execute(
+                            "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
+                            (range_start, range_end)
+                        ).fetchall()
+                        if rows:
+                            return "\n\n".join(r[0] for r in rows)
+                        return f"No conversations found in time range {time_range} on {date}."
+                    except (ValueError, IndexError) as e:
+                        return f"Error parsing query: {e}"
+                else:
+                    return f"Unknown query_type: {query_type}. Use 'global', 'day', or 'conversation'."
+            finally:
+                conn.close()
+
+    def list_memories_sync(self, memory_type: str) -> str:
+        """List episodic or semantic memories with their IDs."""
+        import sqlite3
+        with self._sync_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "episodic":
+                    rows = conn.execute(
+                        "SELECT id, content, created_at FROM episodic_memories ORDER BY created_at DESC"
+                    ).fetchall()
+                    if not rows:
+                        return "No episodic memories stored."
+                    parts = []
+                    for id_, content, created_at in rows:
+                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M")
+                        parts.append(f"[E{id_}] ({dt}) {content}")
+                    total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
+                    return f"Episodic memories ({len(rows)} items, ~{total_tokens}/{MAX_EPISODIC_TOKENS} tokens):\n" + "\n".join(parts)
+
+                elif memory_type == "semantic":
+                    rows = conn.execute(
+                        "SELECT id, content, created_at FROM semantic_memories ORDER BY created_at DESC"
+                    ).fetchall()
+                    if not rows:
+                        return "No semantic memories stored."
+                    parts = []
+                    for id_, content, created_at in rows:
+                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M")
+                        parts.append(f"[S{id_}] ({dt}) {content}")
+                    total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
+                    return f"Semantic memories ({len(rows)} items, ~{total_tokens}/{MAX_SEMANTIC_TOKENS} tokens):\n" + "\n".join(parts)
+                else:
+                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
+            finally:
+                conn.close()
+
+    def delete_memory_sync(self, memory_type: str, memory_id: int) -> str:
+        """Delete a specific episodic or semantic memory by ID."""
+        import sqlite3
+        with self._sync_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "episodic":
+                    if not conn.execute("SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)).fetchone():
+                        return f"Episodic memory E{memory_id} not found."
+                    conn.execute("DELETE FROM episodic_memories WHERE id = ?", (memory_id,))
+                    conn.commit()
+                    return f"Deleted episodic memory E{memory_id}."
+                elif memory_type == "semantic":
+                    if not conn.execute("SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)).fetchone():
+                        return f"Semantic memory S{memory_id} not found."
+                    conn.execute("DELETE FROM semantic_memories WHERE id = ?", (memory_id,))
+                    conn.commit()
+                    return f"Deleted semantic memory S{memory_id}."
+                else:
+                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
+            finally:
+                conn.close()
+
+    def edit_memory_sync(self, memory_type: str, memory_id: int, new_content: str) -> str:
+        """Edit the content of a specific episodic or semantic memory."""
+        import sqlite3
+        with self._sync_lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                if memory_type == "episodic":
+                    if not conn.execute("SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)).fetchone():
+                        return f"Episodic memory E{memory_id} not found."
+                    conn.execute("UPDATE episodic_memories SET content = ? WHERE id = ?", (new_content, memory_id))
+                    conn.commit()
+                    return f"Updated episodic memory E{memory_id}."
+                elif memory_type == "semantic":
+                    if not conn.execute("SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)).fetchone():
+                        return f"Semantic memory S{memory_id} not found."
+                    conn.execute("UPDATE semantic_memories SET content = ? WHERE id = ?", (new_content, memory_id))
+                    conn.commit()
+                    return f"Updated semantic memory S{memory_id}."
+                else:
+                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
+            finally:
+                conn.close()
