@@ -25,6 +25,13 @@ DAY_SUMMARY_MAX_SENTENCES = 3
 GLOBAL_SUMMARY_MAX_SENTENCES = 4
 MAX_EPISODIC_TOKENS = 4000    # Token budget for all episodic memories combined
 MAX_SEMANTIC_TOKENS = 1500    # Token budget for all semantic memories combined
+PRECALL_RECENT_MESSAGES = 20
+PRECALL_MAX_SEMANTIC_CANDIDATES = 24
+PRECALL_MAX_EPISODIC_CANDIDATES = 36
+PRECALL_SELECTION_LIMIT = 8
+COMPACTION_KEEP_MIN = 15
+COMPACTION_KEEP_MAX = 20
+COMPACTION_KEEP_DEFAULT = 18
 
 
 class Memory:
@@ -34,6 +41,7 @@ class Memory:
         self.extraction_model = "qwen/qwen3-32b"
         self.filter_model = "llama-3.1-8b-instant"
         self._lock = asyncio.Lock()
+        self._compaction_lock = asyncio.Lock()
         self._sync_lock = threading.Lock()  # For sync tool methods (Gemini AFC)
 
     def set_groq_client(self, client: Groq):
@@ -116,6 +124,20 @@ class Memory:
         row = await cursor.fetchone()
         return row[0] if row else None
 
+    async def get_active_conversation_message_count(self) -> int:
+        """Return message count for current active conversation."""
+        async with aiosqlite.connect(self.db_path) as db:
+            conv_id = await self._get_active_conversation(db)
+            if conv_id is None:
+                return 0
+
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conv_id,)
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
     async def _get_last_message_time(self, db, conv_id: int) -> Optional[float]:
         """Get the timestamp of the last message in a conversation."""
         cursor = await db.execute(
@@ -141,7 +163,8 @@ class Memory:
         return conv_id
 
     async def add_message(self, role: str, content: str):
-        """Insert a message. Handles conversation boundaries and CC overflow."""
+        """Insert a message and handle conversation boundaries.
+        CC compaction is intentionally moved off the hot path and runs in background."""
         now = time.time()
         async with self._lock:
             async with aiosqlite.connect(self.db_path) as db:
@@ -162,9 +185,6 @@ class Memory:
                     (conv_id, role, content, now)
                 )
                 await db.commit()
-
-                # Check if we need to update CC summary (buffer overflow)
-                await self._maybe_update_cc(db, conv_id)
 
     async def _maybe_update_cc(self, db, conv_id: int):
         """If the conversation has more than IMMEDIATE_BUFFER_INTERACTIONS interactions,
@@ -477,32 +497,38 @@ class Memory:
 
     # ── Context Retrieval (for prompt assembly) ─────────────
 
-    async def get_conversation_context(self) -> Dict[str, Any]:
-        """Returns the CC for the active conversation:
-        {"summary": str, "messages": [{"role": ..., "content": ..., "timestamp": ...}]}
-        """
-        async with self._lock:
-            async with aiosqlite.connect(self.db_path) as db:
-                conv_id = await self._get_active_conversation(db)
-                if conv_id is None:
-                    return {"summary": "", "messages": []}
+    async def get_conversation_context(self, limit_messages: Optional[int] = None) -> Dict[str, Any]:
+        """Returns CC for the active conversation.
+        If limit_messages is provided, returns only the latest N messages."""
+        async with aiosqlite.connect(self.db_path) as db:
+            conv_id = await self._get_active_conversation(db)
+            if conv_id is None:
+                return {"summary": "", "messages": []}
 
-                # Get CC summary
+            cursor = await db.execute(
+                "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+                (conv_id,)
+            )
+            row = await cursor.fetchone()
+            summary = row[0] if row and row[0] else ""
+
+            if limit_messages and limit_messages > 0:
                 cursor = await db.execute(
-                    "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-                    (conv_id,)
+                    "SELECT role, content, timestamp FROM messages "
+                    "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+                    (conv_id, limit_messages)
                 )
-                row = await cursor.fetchone()
-                summary = row[0] if row and row[0] else ""
-
-                # Get buffered messages (the immediate buffer)
+                fetched = await cursor.fetchall()
+                fetched.reverse()
+                messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched]
+            else:
                 cursor = await db.execute(
                     "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
                     (conv_id,)
                 )
                 messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in await cursor.fetchall()]
 
-                return {"summary": summary, "messages": messages}
+            return {"summary": summary, "messages": messages}
 
     async def get_today_conversation_summaries(self) -> str:
         """Get summaries of all closed conversations from today."""
@@ -582,6 +608,333 @@ class Memory:
             return "(No relevant episodic memories)"
 
         return "\n".join(f"• {m}" for m in relevant)
+
+    @staticmethod
+    def _coerce_id_list(values: Any) -> List[int]:
+        """Coerce a mixed list of ids into unique integers preserving order."""
+        if not isinstance(values, list):
+            return []
+        result: List[int] = []
+        seen = set()
+        for value in values:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed not in seen:
+                seen.add(parsed)
+                result.append(parsed)
+        return result
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3] + "..."
+
+    @staticmethod
+    def _finalize_inference_context(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove internal helper fields before returning to caller."""
+        cleaned = dict(data)
+        cleaned.pop("_semantic_candidates", None)
+        cleaned.pop("_episodic_candidates", None)
+        return cleaned
+
+    async def get_lightweight_inference_context(
+        self,
+        user_text: str,
+        event_type: str = "user",
+        recent_limit: int = PRECALL_RECENT_MESSAGES,
+    ) -> Dict[str, Any]:
+        """Fast local-only context assembly fallback (no Groq call)."""
+        today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+        today_start = datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+        today_epoch = today_start.timestamp()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            conv_id = await self._get_active_conversation(db)
+            cc_summary = ""
+            recent_messages: List[Dict[str, Any]] = []
+
+            if conv_id is not None:
+                cursor = await db.execute(
+                    "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+                    (conv_id,)
+                )
+                row = await cursor.fetchone()
+                cc_summary = row[0] if row and row[0] else ""
+
+                cursor = await db.execute(
+                    "SELECT role, content, timestamp FROM messages "
+                    "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+                    (conv_id, max(1, recent_limit))
+                )
+                fetched = await cursor.fetchall()
+                fetched.reverse()
+                recent_messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched]
+
+            cursor = await db.execute(
+                "SELECT summary FROM conversations "
+                "WHERE is_closed = 1 AND started_at >= ? AND summary IS NOT NULL "
+                "ORDER BY started_at DESC LIMIT 6",
+                (today_epoch,)
+            )
+            today_rows = await cursor.fetchall()
+            today_rows.reverse()
+            today_summaries = "\n".join(f"- {r[0]}" for r in today_rows) if today_rows else "(No earlier conversations today)"
+
+            cursor = await db.execute(
+                "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
+            )
+            global_row = await cursor.fetchone()
+            global_summary = global_row[0] if global_row else "(No global memory yet)"
+
+            cursor = await db.execute(
+                "SELECT id, content FROM semantic_memories ORDER BY created_at DESC LIMIT ?",
+                (PRECALL_MAX_SEMANTIC_CANDIDATES,)
+            )
+            semantic_rows = await cursor.fetchall()
+
+            cursor = await db.execute(
+                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC LIMIT ?",
+                (PRECALL_MAX_EPISODIC_CANDIDATES,)
+            )
+            episodic_rows = await cursor.fetchall()
+
+        semantic_candidates = [{"id": r[0], "content": str(r[1])} for r in semantic_rows]
+        episodic_candidates = [{"id": r[0], "content": str(r[1])} for r in episodic_rows]
+
+        route = {
+            "requires_tools": False,
+            "complexity": "fast",
+            "provider_hint": "auto",
+            "model_hint": "",
+        }
+
+        context_summary = cc_summary or "(No prior summary in this conversation)"
+        return {
+            "conversation_id": conv_id,
+            "event_type": event_type,
+            "user_text": user_text,
+            "cc_summary": cc_summary,
+            "context_summary": context_summary,
+            "recent_messages": recent_messages,
+            "today_summaries": today_summaries,
+            "global_summary": global_summary,
+            "selected_semantic": [c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]],
+            "selected_episodic": [c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]],
+            "route": route,
+            "_semantic_candidates": semantic_candidates,
+            "_episodic_candidates": episodic_candidates,
+        }
+
+    async def prepare_inference_context(
+        self,
+        user_text: str,
+        event_type: str = "user",
+        requested_provider: str = "",
+        requested_model: str = "",
+        allowed_models: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """One Groq pre-call for memory selection + routing hints before main inference."""
+        base = await self.get_lightweight_inference_context(
+            user_text=user_text,
+            event_type=event_type,
+            recent_limit=PRECALL_RECENT_MESSAGES,
+        )
+
+        if not self.groq_client:
+            return self._finalize_inference_context(base)
+
+        semantic_candidates = base.get("_semantic_candidates", [])
+        episodic_candidates = base.get("_episodic_candidates", [])
+
+        payload = {
+            "event_type": event_type,
+            "user_text": user_text,
+            "requested_provider": requested_provider,
+            "requested_model": requested_model,
+            "allowed_models": allowed_models or [],
+            "conversation_context_summary": self._truncate_text(base.get("cc_summary", ""), 2400),
+            "recent_messages": [
+                {
+                    "role": m.get("role", ""),
+                    "content": self._truncate_text(str(m.get("content", "")), 300),
+                }
+                for m in base.get("recent_messages", [])[-PRECALL_RECENT_MESSAGES:]
+            ],
+            "today_summaries": self._truncate_text(base.get("today_summaries", ""), 2400),
+            "global_summary": self._truncate_text(base.get("global_summary", ""), 1200),
+            "semantic_candidates": [
+                {"id": c["id"], "content": self._truncate_text(c["content"], 220)}
+                for c in semantic_candidates
+            ],
+            "episodic_candidates": [
+                {"id": c["id"], "content": self._truncate_text(c["content"], 220)}
+                for c in episodic_candidates
+            ],
+        }
+
+        prompt = (
+            "Analyze the payload and prepare compact memory context for the next assistant response.\n"
+            "Return ONLY valid JSON with this schema:\n"
+            "{"
+            "\"context_summary\":\"string <= 6 sentences\","
+            "\"semantic_ids\":[int,... up to 8],"
+            "\"episodic_ids\":[int,... up to 8],"
+            "\"route\":{"
+            "\"requires_tools\":true/false,"
+            "\"complexity\":\"fast|deep\","
+            "\"provider_hint\":\"auto|groq|gemini\","
+            "\"model_hint\":\"optional model name\""
+            "}"
+            "}\n"
+            "Selection rules:\n"
+            "- Pick ONLY IDs present in candidates.\n"
+            "- If user asks to run commands/read-write files/logs/schedule/manage memory, set requires_tools=true.\n"
+            "- Prefer provider_hint=groq unless tools are clearly required.\n"
+            "- context_summary must be concise and directly useful.\n\n"
+            f"Payload JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+        data = await self._call_groq_json(
+            prompt,
+            system="You prepare AI inference context. Output ONLY valid JSON.",
+            model=self.filter_model,
+            temperature=0.1,
+            max_retries=1,
+        )
+
+        if not isinstance(data, dict):
+            return self._finalize_inference_context(base)
+
+        semantic_ids = self._coerce_id_list(data.get("semantic_ids", []))
+        episodic_ids = self._coerce_id_list(data.get("episodic_ids", []))
+        semantic_map = {c["id"]: c["content"] for c in semantic_candidates}
+        episodic_map = {c["id"]: c["content"] for c in episodic_candidates}
+
+        selected_semantic = [semantic_map[mid] for mid in semantic_ids if mid in semantic_map][:PRECALL_SELECTION_LIMIT]
+        selected_episodic = [episodic_map[mid] for mid in episodic_ids if mid in episodic_map][:PRECALL_SELECTION_LIMIT]
+
+        if not selected_semantic:
+            selected_semantic = [c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]]
+        if not selected_episodic:
+            selected_episodic = [c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]]
+
+        route_raw = data.get("route", {}) if isinstance(data.get("route"), dict) else {}
+        complexity = str(route_raw.get("complexity", "fast")).strip().lower()
+        if complexity not in {"fast", "deep"}:
+            complexity = "fast"
+
+        provider_hint = str(route_raw.get("provider_hint", "auto")).strip().lower()
+        if provider_hint not in {"auto", "groq", "gemini"}:
+            provider_hint = "auto"
+
+        requires_tools_raw = route_raw.get("requires_tools", False)
+        if isinstance(requires_tools_raw, bool):
+            requires_tools = requires_tools_raw
+        elif isinstance(requires_tools_raw, str):
+            requires_tools = requires_tools_raw.strip().lower() in {"true", "1", "yes", "y"}
+        else:
+            requires_tools = bool(requires_tools_raw)
+
+        model_hint = str(route_raw.get("model_hint", "")).strip()
+        if allowed_models:
+            allowed_lookup = {m.lower(): m for m in allowed_models}
+            model_hint = allowed_lookup.get(model_hint.lower(), "")
+
+        context_summary = str(data.get("context_summary", "")).strip() or base.get("context_summary", "")
+        base["context_summary"] = context_summary
+        base["selected_semantic"] = selected_semantic
+        base["selected_episodic"] = selected_episodic
+        base["route"] = {
+            "requires_tools": requires_tools,
+            "complexity": complexity,
+            "provider_hint": provider_hint,
+            "model_hint": model_hint,
+        }
+
+        return self._finalize_inference_context(base)
+
+    async def compact_conversation_context_if_due(self, keep_last: int = COMPACTION_KEEP_DEFAULT) -> bool:
+        """Fold older messages into CC summary, keeping the most recent 15-20 messages."""
+        if not self.groq_client:
+            return False
+
+        keep_last = max(COMPACTION_KEEP_MIN, min(COMPACTION_KEEP_MAX, int(keep_last)))
+
+        async with self._compaction_lock:
+            # Snapshot what to fold without keeping the main write lock during Groq call.
+            async with self._lock:
+                async with aiosqlite.connect(self.db_path) as db:
+                    conv_id = await self._get_active_conversation(db)
+                    if conv_id is None:
+                        return False
+
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                        (conv_id,)
+                    )
+                    total_messages = (await cursor.fetchone())[0]
+                    if total_messages <= keep_last:
+                        return False
+
+                    overflow_count = total_messages - keep_last
+                    cursor = await db.execute(
+                        "SELECT id, role, content FROM messages "
+                        "WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+                        (conv_id, overflow_count)
+                    )
+                    overflow_rows = await cursor.fetchall()
+                    if not overflow_rows:
+                        return False
+
+                    cursor = await db.execute(
+                        "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
+                        (conv_id,)
+                    )
+                    row = await cursor.fetchone()
+                    current_summary = row[0] if row and row[0] else ""
+
+            overflow_text = "\n".join(
+                f"[{role}]: {content}" for _, role, content in overflow_rows
+            )
+            new_summary = await self._summarize_cc(current_summary, overflow_text)
+            if not new_summary:
+                logger.warning(f"Background CC compaction failed for conversation {conv_id}")
+                return False
+
+            ids_to_delete = [row[0] for row in overflow_rows]
+            async with self._lock:
+                async with aiosqlite.connect(self.db_path) as db:
+                    active_conv = await self._get_active_conversation(db)
+                    if active_conv != conv_id:
+                        return False
+
+                    await db.execute(
+                        "UPDATE conversation_context SET summary_text = ?, updated_at = ? WHERE conversation_id = ?",
+                        (new_summary, time.time(), conv_id)
+                    )
+
+                    placeholders = ",".join(["?"] * len(ids_to_delete))
+                    cursor = await db.execute(
+                        f"SELECT id FROM messages WHERE id IN ({placeholders})",
+                        ids_to_delete
+                    )
+                    existing_ids = [r[0] for r in await cursor.fetchall()]
+                    if existing_ids:
+                        del_placeholders = ",".join(["?"] * len(existing_ids))
+                        await db.execute(
+                            f"DELETE FROM messages WHERE id IN ({del_placeholders})",
+                            existing_ids
+                        )
+
+                    await db.commit()
+
+            logger.info(
+                f"Compacted conversation {conv_id}: folded {len(ids_to_delete)} messages, kept latest {keep_last}"
+            )
+            return True
 
     # ── Scheduled Jobs ──────────────────────────────────────
 

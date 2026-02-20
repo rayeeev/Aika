@@ -1,226 +1,211 @@
-# 🤖 Aika - Autonomous AI Agent
+# Aika - Inference V4 (Groq-First)
 
-Aika is an autonomous AI agent living on a Raspberry Pi 5, connected via Telegram. She has full system control, a conversation-based memory system, and her own personality.
+Aika is a Telegram AI agent for Raspberry Pi with Groq-first inference, Gemini fallback, and a latency-optimized memory pipeline.
 
-## ✨ Features
+## What Changed in V4
 
-- **Conversation-Based Memory** — Automatic conversation boundaries (30-min gap), rolling context summaries, episodic & semantic memory extraction, day/global memory consolidation
-- **Voice Message Support** — Transcribes voice via Groq Whisper (whisper-large-v3-turbo)
-- **API Key Rotation** — Multiple Gemini keys with automatic failover
-- **Time-Gap Awareness** — Understands conversation breaks naturally
-- **Tool Use** — Shell commands, file I/O, directory listing, server log access, memory recall
-- **Self-Scheduling** — Can schedule wake-ups to remind or check on things
-- **Graceful Shutdown** — Clean resource cleanup on SIGINT/SIGTERM
+- Groq is now the primary inference provider
+- Per-turn memory path is optimized to one Groq pre-call before main generation
+- Background Conversation Context compaction checks every 5 turns
+- Compaction keeps latest 15-20 messages live and folds older ones into summary
+- Capability-based routing chooses Gemini when tool-heavy/system actions are needed
+- Prompt-level model/provider controls are supported
 
-## 🧠 Memory Architecture
+## Request Lifecycle (Runtime Contract)
 
-Aika uses a **conversation-centric memory system** with multiple layers of consolidation.
+For each incoming turn:
 
-```
-┌──────────────────────────────────────────────────────┐
-│              CONTEXT COMPOSER                        │
-│         (Assembled before each Gemini call)          │
-│                                                      │
-│    System Prompt + Tools                             │
-│    + Conversation Context (CC summary + buffer)      │
-│    + Today's conversation summaries                  │
-│    + Semantic memories (stable facts)                │
-│    + Appropriate episodic memories (Groq-filtered)   │
-└──────────────┬───────────────────────────────────────┘
-               │
-               ▼
-┌────────────────────────────────────────────────────────┐
-│           CONVERSATION LAYER                           │
-│                                                        │
-│  Immediate Buffer: last 10 interactions (20 msgs)      │
-│  CC Summary: ≤3 sentence rolling summary of older      │
-│  messages in the same conversation                     │
-│                                                        │
-│  30-min gap → close conversation → summarize + extract │
-└──────────────┬─────────────────────────────────────────┘
-               │
-               ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│           MEMORY LAYERS                                                   │
-│                                                                           │
-│  📅 Episodic  — extracted when conversations close (~4000 token budget)   │
-│  💡 Semantic  — distilled from episodic at 4:00 AM (~300 token budget)    │
-│  📋 Day Memory — 3-sentence summary of each day                           │
-│  🌐 Global Memory — 4-sentence rolling overview                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+1. Input is debounced and buffered (0.8s)
+2. **Groq PreCall** (`memory.prepare_inference_context`) runs once
+3. Main call runs on Groq by default, or Gemini when routed/requested
+4. If Groq fails, Gemini fallback runs and receives Groq error context
+5. User/model messages are stored asynchronously
+6. Every 5 turns, background compaction runs once (`compact_conversation_context_if_due`)
 
-### Lifecycle
+Foreground path is designed to avoid long blocking memory work.
 
-1. **Live** — Messages go into the immediate buffer (last 10 interactions). When the buffer overflows, oldest messages are folded into a ≤3 sentence CC summary via Groq.
-2. **Conversation Close** — After 30 min of inactivity, the full conversation is sent to Groq for a 4-sentence summary and episodic memory extraction.
-3. **Daily (4:00 AM)** — All conversation summaries from the day are consolidated into a 3-sentence day memory. Episodic memories are analyzed to create semantic memories.
-4. **Daily (4:10 AM)** — The latest day memory is merged into the global memory (4-sentence rolling summary).
-5. **Weekly (4:20 AM Sunday)** — Groq reviews all episodic and semantic memories, removing duplicates and stale entries.
+## Provider and Model Routing
 
-### Context Assembly (per prompt)
+### Default policy
 
-| Section | Source |
-|---------|--------|
-| System prompt | Static personality + tool rules |
-| Today's conversations | Summaries of closed conversations from today |
-| Semantic memories | All stable facts/preferences |
-| Appropriate memories | Episodic memories filtered by Groq (`llama-3.1-8b-instant`) |
-| Chat history | CC summary + immediate buffer messages |
+- Capability-based
+- Groq first
+- Gemini when tools are likely required or explicitly requested
 
-## 📋 Requirements
+### Prompt controls
+
+You can place these in user prompts:
+
+- `[PROVIDER=groq]` or `[PROVIDER=gemini]`
+- `[MODEL=<groq_model_name>]`
+- `[REASONING=fast]` or `[REASONING=deep]`
+
+Controls are removed from message text before model generation.
+
+### Hardcoded Groq allowlist
+
+Defined in `src/main.py`:
+
+- `llama-3.1-8b-instant`
+- `llama-3.3-70b-versatile`
+- `qwen/qwen3-32b`
+- `deepseek-r1-distill-llama-70b`
+
+If a requested model is not in this allowlist, Aika falls back to default model selection.
+
+## Memory Architecture
+
+Memory remains Groq-driven.
+
+### Layers
+
+- **Conversation Context (CC)**
+  - `conversation_context.summary_text` (rolled summary)
+  - Active recent messages in `messages`
+- **Episodic memories**
+- **Semantic memories**
+- **Day memories**
+- **Global memory**
+
+### Live context behavior
+
+- PreCall selects relevant semantic + episodic memories in one Groq JSON call
+- Selected memories and compact context summary are injected into main prompt
+
+### Background compaction
+
+- Trigger: every 5 turns
+- Guard: compaction only runs when active conversation already has at least 15 messages
+- Action: fold oldest active-conversation messages into CC summary
+- Preserve: latest 15-20 messages (default 18)
+- Runs asynchronously and does not block response generation
+
+### Conversation boundaries
+
+- 30 minutes inactivity closes active conversation
+- Close pipeline extracts:
+  - conversation summary
+  - episodic memories
+
+### Scheduled jobs
+
+- `close_stale_conversations`: every 5 minutes
+- `run_daily_summary`: 4:00 AM
+- `run_global_update`: 4:10 AM
+- `run_weekly_cleanup`: Sunday 4:20 AM
+
+## Sync vs Async Design
+
+### Async
+
+- Telegram handlers
+- DB access (`aiosqlite`)
+- Inference orchestration
+- Background compaction and proactive tasks
+
+### Sync (wrapped safely)
+
+- Tool implementations for Gemini AFC
+- Groq/Gemini SDK calls executed through executor where needed
+
+## Latency Controls
+
+Configured in `src/main.py`:
+
+- PreCall timeout: `2.5s`
+- Main call timeout: `9.0s`
+- Fallback call timeout: `9.0s`
+- End-to-end generation cap: `24.0s`
+
+## Requirements
 
 - Python 3.11+
-- Raspberry Pi 5 (or any Linux system)
-- Telegram Bot Token
-- Gemini API Key(s)
-- Groq API Key
+- Telegram bot token
+- Groq API key
+- Gemini API key(s) for fallback/tool routing (optional but recommended)
 
-## 🚀 Quick Start
-
-### 1. Clone & Setup
-
-```bash
-git clone <your-repo-url>
-cd Aika
-```
-
-### 2. Create Virtual Environment
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
+## Environment Variables
 
-Create a `.env` file in the project root:
+Required:
 
 ```bash
-# Required
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-GEMINI_API_KEYS=key1,key2,key3   # Comma-separated, tries each until one works
-GROQ_API_KEY=your_groq_api_key
-ALLOWED_USER_ID=your_telegram_user_id
-
-# Optional
-AIKA_STARTUP_MESSAGE=true      # Set to 'false' to disable startup message
-AIKA_DB_PATH=/path/to/aika.db  # Custom database path (default: ./aika.db)
+TELEGRAM_BOT_TOKEN=...
+GROQ_API_KEY=...
+ALLOWED_USER_ID=...
 ```
 
-> **💡 API Key Rotation**: You can provide multiple Gemini API keys separated by commas. If one key fails (rate limit, quota exceeded, etc.), Aika automatically tries the next one.
+Recommended (for fallback/tool routing):
 
-#### Getting Your Telegram User ID
+```bash
+GEMINI_API_KEYS=key1,key2,key3
+```
 
-1. Message [@userinfobot](https://t.me/userinfobot) on Telegram
-2. It will reply with your user ID
+Optional:
 
-#### Creating a Telegram Bot
+```bash
+AIKA_STARTUP_MESSAGE=true
+AIKA_DB_PATH=/path/to/aika.db
+```
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the bot token to your `.env` file
-
-### 5. Run the Server
+## Run
 
 ```bash
 python -m src.main
 ```
 
-Or for production with auto-restart:
+## Project Structure
 
-```bash
-sudo nano /etc/systemd/system/aika.service
-```
-
-Add the following:
-
-```ini
-[Unit]
-Description=Aika AI Agent
-After=network.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/Aika
-Environment=PATH=/home/pi/Aika/venv/bin
-ExecStart=/home/pi/Aika/venv/bin/python -m src.main
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable aika
-sudo systemctl start aika
-```
-
-## 📁 Project Structure
-
-```
+```text
 Aika/
 ├── src/
-│   ├── main.py      # Bot, message handling, tools, LLM orchestration
-│   └── memory.py    # Conversations, CC, episodic/semantic, day/global memory
-├── .env
+│   ├── main.py      # Telegram bot + inference routing + tools
+│   └── memory.py    # Memory DB + Groq pre-call + compaction + summaries
+├── README.md
 ├── requirements.txt
-├── aika.db          # SQLite (auto-created)
-├── aika.log         # Server logs (cleared on restart)
-└── README.md
+├── aika.db          # auto-created
+└── aika.log
 ```
 
-## 🔧 Tools
+## Tool Surface (Gemini AFC)
 
-| Tool | Description |
-|------|-------------|
-| `execute_shell_command(cmd)` | Run shell commands (60s timeout) |
-| `read_file(path)` | Read file contents |
-| `write_file(path, content)` | Write content to a file |
-| `list_directory(path)` | List directory contents |
-| `schedule_wake_up(seconds, thought)` | Schedule self-initiated check-in |
-| `read_server_logs(lines)` | Read Aika's own server logs |
-| `recall_memory(query_type, date, time_range)` | Retrieve global/day/conversation memories |
-| `list_memories(memory_type)` | List episodic or semantic memories with IDs |
-| `delete_memory(memory_type, memory_id)` | Delete a specific memory by type and ID |
-| `edit_memory(memory_type, memory_id, new_content)` | Edit a specific memory's content |
+- `execute_shell_command(cmd)`
+- `read_file(path)`
+- `write_file(path, content)`
+- `list_directory(path)`
+- `schedule_wake_up(seconds, thought, provider=\"\", model=\"\", reasoning=\"\")`
+- `read_server_logs(lines)`
+- `recall_memory(query_type, date, time_range)`
+- `list_memories(memory_type)`
+- `delete_memory(memory_type, memory_id)`
+- `edit_memory(memory_type, memory_id, new_content)`
 
-## 🔒 Security
+`schedule_wake_up(...)` can force delayed-task routing to a specific provider/model (for example `provider=\"gemini\"` or `model=\"groq/compound\"`) when default routing chooses the wrong main AI.
 
-- **Single User** - Only responds to `ALLOWED_USER_ID`
-- **No Path Traversal** - File operations use absolute paths
-- **Timeout Protection** - Shell commands timeout after 60 seconds
-- **Graceful Shutdown** - Clean resource cleanup
+Examples:
+- `schedule_wake_up(300, "Check if deploy finished")` uses default routing
+- `schedule_wake_up(120, "Search latest docs and summarize", provider="groq", model="groq/compound", reasoning="deep")`
+- `schedule_wake_up(600, "Run this task with Gemini", provider="gemini")`
 
-## 📊 Monitoring
-
-Check logs:
+## Monitoring
 
 ```bash
-# If running with systemd
-sudo journalctl -u aika -f
-
-# Aika's own log file (also readable by Aika via read_server_logs tool)
 tail -f aika.log
-
-# If running directly, logs output to stdout
 ```
 
-## 📜 License
+If running with systemd:
 
-Private project. All rights reserved.
+```bash
+sudo journalctl -u aika -f
+```
 
----
+## Notes
 
-*Built with ❤️ for autonomous AI exploration*
+- Memory compaction and retrieval logic is Groq-based.
+- Groq remains primary generation path unless routing decides otherwise.
+- Gemini is used for fallback and tool-heavy turns.
