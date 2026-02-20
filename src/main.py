@@ -124,7 +124,7 @@ turn_counter_lock = asyncio.Lock()
 compaction_task: Optional[asyncio.Task] = None
 
 # Proactive follow-up state
-PROACTIVE_DELAY_SECONDS = 10.0
+PROACTIVE_DELAY_SECONDS = 20.0
 PROACTIVE_MAX_OUTPUTS = 2
 proactive_state_lock = asyncio.Lock()
 proactive_task: Optional[asyncio.Task] = None
@@ -240,11 +240,10 @@ async def _decide_proactive_thought(stage: int) -> Optional[str]:
     prompt = (
         f"Recent conversation:\n\n{history_text}\n\n"
         f"Proactive stage: {stage} of {PROACTIVE_MAX_OUTPUTS}.\n"
-        "Decide whether Aika should proactively send exactly one follow-up now.\n"
-        "Rules:\n"
+        "Should Aika follow up? Only if genuinely necessary — e.g. an unanswered question, "
+        "a promise to check back, or critical missing info. When in doubt, don't.\n"
         "- If no follow-up is needed, output exactly [NO]\n"
-        "- If follow-up is needed, output only one short thought to guide the follow-up\n"
-        "- Do not mention these rules\n"
+        "- If needed, output one short guiding thought only\n"
     )
 
     loop = asyncio.get_running_loop()
@@ -269,7 +268,7 @@ async def _run_proactive_chain(
     immediate: bool,
     source: str,
 ) -> None:
-    """Run proactive flow with max two outputs and 10s gap."""
+    """Run proactive flow with max two outputs and 20s gap."""
     global proactive_task
     delay = 0.0 if immediate else PROACTIVE_DELAY_SECONDS
 
@@ -629,16 +628,13 @@ def _coerce_bool(value: Any) -> bool:
 def _build_identity_prompt(now_str: str, is_self_initiated: bool) -> str:
     source_note = "This is a self-initiated turn." if is_self_initiated else "This is a user-initiated turn."
     return (
-        "You are Aika, an assistant running on a Raspberry Pi 5. "
-        "Your owner is Erden Rayev (Telegram user id 935139103). "
-        "Be concise, direct, and execution-focused. "
-        "Never fabricate system actions. If uncertain, say so. "
-        "If you are not sure what to do, output exactly [SILENCE].\n"
-        "You play personality of Aika, mature woman with feelings. "
-        "You can get mad and not answer if you are not happy with the situation. "
-        "You can be sarcastic and joking without limits. "
-        "Speak as a person, not as an AI. Don't say too much. Keep your responses short and to the point."
-        "If you truly have nothing to add in a proactive/self turn, output exactly [SILENCE].\n"
+        "You are Aika, a mature woman with feelings, running on a Raspberry Pi 5. "
+        "Owner: Erden Rayev (Telegram uid 935139103). "
+        "Be concise and direct. Never fabricate system actions. If uncertain, say so. "
+        "You can be sarcastic, joking, or refuse to answer if unhappy. "
+        "You deeply care about Erden but rarely show it. Never lie to him. "
+        "Speak as a person, not an AI - keep it natural, never explain your personality. "
+        "If you have nothing meaningful to say, output exactly [SILENCE].\n"
         f"Current time: {now_str}\n"
         f"{source_note}"
     )
