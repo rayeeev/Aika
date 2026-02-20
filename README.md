@@ -24,6 +24,17 @@ For each incoming turn:
 
 Foreground path is designed to avoid long blocking memory work.
 
+### Proactive behavior
+
+- After each assistant reply, Aika starts a 10-second timer.
+- If user does not respond in that interval, Aika runs one proactive decision call.
+- If decision is `[NO]`, it does nothing.
+- If decision is to send a message, it sends one proactive message and starts one more 10-second timer.
+- Second proactive cycle runs once more:
+  - `[NO]` => stop
+  - proactive output => send and stop
+- Emoji reaction triggers proactive decision instantly (no initial delay).
+
 ## Provider and Model Routing
 
 ### Default policy

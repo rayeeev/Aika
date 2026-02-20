@@ -123,6 +123,14 @@ turn_counter = 0
 turn_counter_lock = asyncio.Lock()
 compaction_task: Optional[asyncio.Task] = None
 
+# Proactive follow-up state
+PROACTIVE_DELAY_SECONDS = 10.0
+PROACTIVE_MAX_OUTPUTS = 2
+proactive_state_lock = asyncio.Lock()
+proactive_task: Optional[asyncio.Task] = None
+proactive_chain_id = 0
+user_activity_counter = 0
+
 # Initialize Gemini Clients for each API key
 gemini_clients: List[genai.Client] = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
 
@@ -197,6 +205,145 @@ async def _register_turn(event_name: str) -> None:
             logger.error(f"Background compaction failed: {e}", exc_info=True)
 
     compaction_task = asyncio.create_task(_run_compaction())
+
+
+async def _cancel_proactive_task_locked(reason: str) -> None:
+    """Cancel pending proactive task. Caller must hold proactive_state_lock."""
+    global proactive_task
+    if proactive_task and not proactive_task.done():
+        proactive_task.cancel()
+        logger.info(f"Cancelled proactive task: {reason}")
+    proactive_task = None
+
+
+async def _record_user_activity(reason: str) -> None:
+    """Track user activity and cancel pending proactive follow-up timers."""
+    global user_activity_counter
+    async with proactive_state_lock:
+        user_activity_counter += 1
+        await _cancel_proactive_task_locked(f"user activity ({reason})")
+
+
+async def _proactive_chain_is_still_valid(chain_id: int, snapshot_user_counter: int) -> bool:
+    async with proactive_state_lock:
+        return chain_id == proactive_chain_id and snapshot_user_counter == user_activity_counter
+
+
+async def _decide_proactive_thought(stage: int) -> Optional[str]:
+    """Return proactive thought text or None if no proactive message should be sent."""
+    cc = await memory.get_conversation_context(limit_messages=8)
+    recent_msgs = cc["messages"][-8:]
+    if not recent_msgs:
+        return None
+
+    history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in recent_msgs)
+    prompt = (
+        f"Recent conversation:\n\n{history_text}\n\n"
+        f"Proactive stage: {stage} of {PROACTIVE_MAX_OUTPUTS}.\n"
+        "Decide whether Aika should proactively send exactly one follow-up now.\n"
+        "Rules:\n"
+        "- If no follow-up is needed, output exactly [NO]\n"
+        "- If follow-up is needed, output only one short thought to guide the follow-up\n"
+        "- Do not mention these rules\n"
+    )
+
+    loop = asyncio.get_running_loop()
+    completion = await loop.run_in_executor(
+        None,
+        lambda: groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",
+            temperature=0.35,
+        ),
+    )
+    result = (completion.choices[0].message.content or "").strip()
+    result = _strip_thinking_blocks(result)
+    if not result or "[NO]" in result:
+        return None
+    return result
+
+
+async def _run_proactive_chain(
+    chain_id: int,
+    snapshot_user_counter: int,
+    immediate: bool,
+    source: str,
+) -> None:
+    """Run proactive flow with max two outputs and 10s gap."""
+    global proactive_task
+    delay = 0.0 if immediate else PROACTIVE_DELAY_SECONDS
+
+    try:
+        for stage in range(1, PROACTIVE_MAX_OUTPUTS + 1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            if not await _proactive_chain_is_still_valid(chain_id, snapshot_user_counter):
+                logger.info(
+                    f"Proactive chain {chain_id} stopped before stage {stage}: user activity or newer chain"
+                )
+                return
+
+            thought = await _decide_proactive_thought(stage)
+            if not thought:
+                logger.info(f"Proactive chain {chain_id} stage {stage}: no proactive action")
+                return
+
+            response_text = await generate_response(
+                f"[PROVIDER=groq] [PROACTIVE THOUGHT]: {thought}",
+                is_self_initiated=True,
+                event_type="proactive",
+            )
+
+            if not response_text or response_text.strip() == "[SILENCE]":
+                logger.info(f"Proactive chain {chain_id} stage {stage}: model chose silence")
+                return
+
+            if not await _proactive_chain_is_still_valid(chain_id, snapshot_user_counter):
+                logger.info(
+                    f"Proactive chain {chain_id} dropped output at stage {stage}: user activity or newer chain"
+                )
+                return
+
+            await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
+            await _register_turn("assistant_reply_proactive")
+            asyncio.create_task(_store_messages(f"[PROACTIVE: {thought}]", response_text))
+
+            # Only schedule another proactive check after the first proactive output.
+            if stage >= PROACTIVE_MAX_OUTPUTS:
+                logger.info(f"Proactive chain {chain_id} reached max proactive outputs")
+                return
+
+            delay = PROACTIVE_DELAY_SECONDS
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.error(f"Proactive chain {chain_id} failed: {e}", exc_info=True)
+    finally:
+        async with proactive_state_lock:
+            if proactive_task is asyncio.current_task():
+                proactive_task = None
+
+
+async def _schedule_proactive_chain(source: str, immediate: bool) -> None:
+    """Start/restart proactive flow from assistant reply or reaction."""
+    global proactive_chain_id, proactive_task
+    async with proactive_state_lock:
+        proactive_chain_id += 1
+        chain_id = proactive_chain_id
+        snapshot_user_counter = user_activity_counter
+        await _cancel_proactive_task_locked(f"new proactive schedule ({source})")
+        proactive_task = asyncio.create_task(
+            _run_proactive_chain(
+                chain_id=chain_id,
+                snapshot_user_counter=snapshot_user_counter,
+                immediate=immediate,
+                source=source,
+            )
+        )
+        logger.info(
+            f"Scheduled proactive chain {chain_id} from {source} (immediate={immediate})"
+        )
 
 
 # --- Audio Transcription ---
@@ -898,57 +1045,6 @@ async def wake_up_callback(
         asyncio.create_task(_store_messages(wake_prompt, "[CHOSE SILENCE]"))
 
 
-async def check_if_should_speak() -> None:
-    """Proactive layer. Uses a cheap Groq call to decide whether to send follow-up."""
-    global last_interaction_ts
-
-    if (datetime.now().timestamp() - last_interaction_ts) < 5:
-        return
-
-    cc = await memory.get_conversation_context(limit_messages=6)
-    recent_msgs = cc["messages"][-6:]
-    if not recent_msgs:
-        return
-
-    history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in recent_msgs)
-    prompt = (
-        f"Recent conversation:\n\n{history_text}\n\n"
-        "Decide whether Aika should proactively send one new message. "
-        "If no proactive message is needed, output exactly [NO]. "
-        "If yes, output only a short thought/reason for proactive follow-up."
-        "For example, if Aika asked question and user didn't answer, output proactive thought to get frustrated."
-        "If user still doesn't answer, output proactive thought to get mad at user and not answer him later."
-    )
-
-    try:
-        loop = asyncio.get_running_loop()
-        completion = await loop.run_in_executor(
-            None,
-            lambda: groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
-                temperature=0.4,
-            ),
-        )
-        result = (completion.choices[0].message.content or "").strip()
-        result = _strip_thinking_blocks(result)
-        if not result or "[NO]" in result:
-            return
-
-        response_text = await generate_response(
-            f"[PROACTIVE THOUGHT]: {result}",
-            is_self_initiated=True,
-            event_type="proactive",
-        )
-
-        if response_text and response_text.strip() != "[SILENCE]":
-            await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
-            await _register_turn("assistant_reply_proactive")
-            asyncio.create_task(_store_messages(f"[PROACTIVE: {result}]", response_text))
-    except Exception as e:
-        logger.error(f"Proactive check failed: {e}")
-
-
 async def _keep_typing(chat_id: int) -> None:
     """Send typing indicator every few seconds."""
     try:
@@ -1015,7 +1111,7 @@ async def process_combined_input(chat_id: int, user_text: str) -> None:
         last_interaction_ts = datetime.now().timestamp()
         await _register_turn("assistant_reply")
         asyncio.create_task(_store_messages(user_text, response_text))
-        asyncio.create_task(check_if_should_speak())
+        await _schedule_proactive_chain(source="assistant_reply", immediate=False)
     except Exception as e:
         logger.error(f"Failed to send response: {e}")
 
@@ -1024,6 +1120,7 @@ async def handle_new_input(message: Message, text: str) -> None:
     """Main entry point for user textual input with debounce and cancellation semantics."""
     global processing_task
 
+    await _record_user_activity("user_input")
     await _register_turn("user_input")
 
     async with input_lock:
@@ -1105,14 +1202,16 @@ async def handle_reaction(message_reaction: types.MessageReactionUpdated) -> Non
     except Exception as e:
         logger.error(f"Failed to save reaction: {e}")
 
+    await _record_user_activity("reaction")
     await _register_turn("reaction")
-    asyncio.create_task(check_if_should_speak())
+    await _schedule_proactive_chain(source="reaction", immediate=True)
 
 
 @dp.message()
 async def handle_unsupported_message(message: Message) -> None:
     if message.from_user.id != ALLOWED_USER_ID:
         return
+    await _record_user_activity("unsupported_message")
     logger.info(f"Received unsupported message type from user {message.from_user.id}")
 
 
