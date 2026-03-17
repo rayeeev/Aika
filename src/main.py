@@ -21,7 +21,7 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types as genai_types
+
 from groq import Groq
 
 from src.memory import COMPACTION_KEEP_DEFAULT, Memory
@@ -144,15 +144,14 @@ gemini_clients: List[genai.Client] = [
 @dataclass
 class AgentSandbox:
     id: str
-    model: str
-    mode: str
+    cli: str  # "claude" or "gemini"
     initial_prompt: str
     state: str  # "running" or "finished"
     created_at: float
-    finished_at: float
+    finished_at: float = -1.0
     task: Optional[asyncio.Task] = None
-    history: List[genai_types.Content] = field(default_factory=list)
-    inbox: List[str] = field(default_factory=list)
+    process: Optional[asyncio.subprocess.Process] = None
+    output: str = ""
 
 
 active_sandboxes: Dict[str, AgentSandbox] = {}
@@ -570,93 +569,118 @@ def read_server_logs(lines: int = 50) -> str:
 
 
 
-async def _run_sandbox_task(agent_id: str) -> None:
-    """Run a Gemini agent sandbox task asynchronously."""
+async def _report_agent_finished(agent_id: str) -> None:
+    """Notify the main conversation that an agent finished, feeding its output to Groq."""
     sandbox = active_sandboxes.get(agent_id)
     if not sandbox:
         return
 
-    if not gemini_clients:
-        logger.error(f"Agent {agent_id}: No Gemini API keys configured")
-        sandbox.state = "finished"
-        sandbox.finished_at = time.time()
-        sandbox.history.append(
-            genai_types.Content(
-                role="model",
-                parts=[genai_types.Part(text="Error: No Gemini API keys configured.")],
-            )
-        )
+    output = sandbox.output.strip() or "(no output)"
+    # Truncate to avoid blowing up the prompt
+    if len(output) > 3000:
+        output = output[:3000] + "...(truncated)"
+
+    report_prompt = (
+        f"[AGENT REPORT] Agent {agent_id} ({sandbox.cli}) has finished.\n"
+        f"Original task: {sandbox.initial_prompt}\n\n"
+        f"Agent output:\n{output}\n\n"
+        "Summarize the result for the user concisely."
+    )
+
+    response_text = await generate_response(
+        report_prompt,
+        is_self_initiated=True,
+        event_type="agent_report",
+    )
+
+    if response_text and response_text.strip() != "[SILENCE]":
+        try:
+            await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
+            await _register_turn("assistant_reply_agent_report")
+            asyncio.create_task(_store_messages(report_prompt, response_text))
+        except Exception as e:
+            logger.error(f"Failed to send agent report for {agent_id}: {e}")
+
+
+# CLI commands per provider. Each returns (executable, args_list).
+AGENT_CLI_COMMANDS: Dict[str, Callable[[str], List[str]]] = {
+    "claude": lambda prompt: [
+        "claude", "--print", "--dangerously-skip-permissions", "-p", prompt,
+    ],
+    "gemini": lambda prompt: [
+        "gemini", "--print", prompt,
+    ],
+}
+
+
+async def _run_sandbox_task(agent_id: str) -> None:
+    """Run an agent by spawning a CLI subprocess (claude, gemini, etc.)."""
+    sandbox = active_sandboxes.get(agent_id)
+    if not sandbox:
         return
 
-    model_name = (
-        "gemini-3-flash-preview" if "flash" in sandbox.model.lower()
-        else "gemini-3.1-pro-preview"
-    )
-    client = gemini_clients[0]
+    cli_builder = AGENT_CLI_COMMANDS.get(sandbox.cli)
+    if not cli_builder:
+        sandbox.output = f"Error: Unknown CLI provider '{sandbox.cli}'"
+        sandbox.state = "finished"
+        sandbox.finished_at = time.time()
+        asyncio.create_task(_report_agent_finished(agent_id))
+        return
+
+    cmd = cli_builder(sandbox.initial_prompt)
+    logger.info(f"Agent {agent_id} spawning: {cmd[0]} (prompt: {sandbox.initial_prompt[:80]})")
 
     try:
-        while sandbox.inbox:
-            prompt_text = sandbox.inbox.pop(0)
-            sandbox.history.append(
-                genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part(text=prompt_text)],
-                )
-            )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        sandbox.process = proc
 
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=model_name,
-                    contents=sandbox.history,
-                ),
-            )
+        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        sandbox.output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        logger.info(f"Agent {agent_id} finished (exit={proc.returncode}, output={len(sandbox.output)} chars)")
 
-            response_text = response.text or "(empty response)"
-            sandbox.history.append(
-                genai_types.Content(
-                    role="model",
-                    parts=[genai_types.Part(text=response_text)],
-                )
-            )
-            logger.info(f"Agent {agent_id} got response ({len(response_text)} chars)")
-
+    except asyncio.TimeoutError:
+        logger.warning(f"Agent {agent_id} timed out after 300s")
+        sandbox.output = "(agent timed out after 5 minutes)"
+        if sandbox.process:
+            sandbox.process.kill()
     except asyncio.CancelledError:
         logger.info(f"Agent {agent_id} was cancelled")
+        if sandbox.process:
+            sandbox.process.kill()
+        sandbox.output = "(agent was cancelled)"
     except Exception as e:
         logger.error(f"Agent {agent_id} failed: {e}", exc_info=True)
-        sandbox.history.append(
-            genai_types.Content(
-                role="model",
-                parts=[genai_types.Part(text=f"Error: {e}")],
-            )
-        )
+        sandbox.output = f"Error: {e}"
     finally:
         sandbox.state = "finished"
         sandbox.finished_at = time.time()
+        asyncio.create_task(_report_agent_finished(agent_id))
 
 
-def create_agent(model_flavor: str, mode: str, prompt: str) -> str:
-    """Create an asynchronous Gemini agent to run a specific long task.
-    model: 'gemini 3.1 flash' or 'gemini 3.1 pro'
-    mode: 'planning' or 'fast'
+def create_agent(cli: str, prompt: str) -> str:
+    """Create an asynchronous CLI agent to run a task autonomously.
+    cli: 'claude' or 'gemini' — which CLI tool to spawn.
+    prompt: the full task description for the agent.
     """
+    cli = cli.lower().strip()
+    if cli not in AGENT_CLI_COMMANDS:
+        return f"Error: Unknown CLI '{cli}'. Available: {', '.join(AGENT_CLI_COMMANDS.keys())}"
     agent_id = str(uuid.uuid4())[:8]
     sandbox = AgentSandbox(
         id=agent_id,
-        model=model_flavor,
-        mode=mode,
+        cli=cli,
         initial_prompt=prompt,
         state="running",
         created_at=time.time(),
-        finished_at=-1.0,
     )
-    sandbox.inbox.append(prompt)
     active_sandboxes[agent_id] = sandbox
     if main_loop:
         sandbox.task = main_loop.create_task(_run_sandbox_task(agent_id))
-        return f"Created agent '{agent_id}'. Will report when finished."
+        return f"Created {cli} agent '{agent_id}'. Will report when finished."
     return "Error: Event loop not ready."
 
 
@@ -673,22 +697,25 @@ def list_agents() -> str:
             else (sb.finished_at - sb.created_at) / 60.0
         )
         res.append(
-            f"Agent {sid} [{sb.state}] | Runtime: {mins:.1f}m | Prompt: {sb.initial_prompt[:50]}"
+            f"Agent {sid} [{sb.cli}] [{sb.state}] | Runtime: {mins:.1f}m | Prompt: {sb.initial_prompt[:50]}"
         )
     return "\n".join(res)
 
 
 def continue_agent(agent_id: str, prompt: str) -> str:
-    """Assign a new prompt/instruction to an existing sandbox."""
+    """Spawn a follow-up CLI task on an existing agent (only works if agent is finished)."""
     sb = active_sandboxes.get(agent_id)
     if not sb:
         return f"Error: Agent {agent_id} not found."
-    sb.inbox.append(prompt)
-    # If the sandbox has finished, re-trigger it to process the new prompt
-    if sb.state == "finished" and main_loop:
+    if sb.state == "running":
+        return f"Agent {agent_id} is still running. Wait for it to finish first."
+    if main_loop:
+        sb.initial_prompt = prompt
+        sb.output = ""
         sb.state = "running"
         sb.task = main_loop.create_task(_run_sandbox_task(agent_id))
-    return f"Instruction queued for agent {agent_id}."
+        return f"Spawned follow-up task on agent {agent_id}."
+    return "Error: Event loop not ready."
 
 
 def stop_agent(agent_id: str) -> str:
@@ -696,8 +723,11 @@ def stop_agent(agent_id: str) -> str:
     sb = active_sandboxes.get(agent_id)
     if not sb:
         return f"Error: Agent {agent_id} not found."
-    if sb.task and not sb.task.done():
-        sb.task.cancel()
+    if sb.state == "running":
+        if sb.process:
+            sb.process.kill()
+        if sb.task and not sb.task.done():
+            sb.task.cancel()
         sb.state = "finished"
         sb.finished_at = time.time()
         return f"Agent {agent_id} stopped."
@@ -800,15 +830,14 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_agent",
-            "description": "Creates a new asynchronous Gemini agent sandbox to run a specific long task.",
+            "description": "Spawns an autonomous CLI agent (claude or gemini) to run a complex task like code changes, git operations, etc. The agent runs in background and reports back when done.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "model_flavor": {"type": "string"},
-                    "mode": {"type": "string"},
-                    "prompt": {"type": "string"},
+                    "cli": {"type": "string", "description": "Which CLI to use: 'claude' or 'gemini'"},
+                    "prompt": {"type": "string", "description": "Full task description for the agent"},
                 },
-                "required": ["model_flavor", "mode", "prompt"],
+                "required": ["cli", "prompt"],
             },
         },
     },
@@ -824,7 +853,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "continue_agent",
-            "description": "Assign a new prompt/instruction to an existing sandbox.",
+            "description": "Spawn a follow-up task on a finished agent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1369,7 +1398,7 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))  # type: ignore
 
-    logger.info("Aika (Inference V4) started")
+    logger.info("Aika (Inference V5) started")
     logger.info(f"Audio temp directory: {AUDIO_TEMP_DIR}")
 
     if SEND_STARTUP_MESSAGE:
