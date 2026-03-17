@@ -503,10 +503,12 @@ def write_file(path: str, content: str) -> str:
 
 
 def list_directory(path: str = ".") -> str:
-    """Lists files in a directory."""
+    """Lists files in a directory (max 100 entries)."""
     try:
         abs_path = os.path.abspath(path)
-        entries = os.listdir(abs_path)
+        entries = sorted(os.listdir(abs_path))
+        if len(entries) > 100:
+            return "\n".join(entries[:100]) + f"\n...(+{len(entries) - 100} more entries)"
         return "\n".join(entries) if entries else "(empty directory)"
     except Exception as e:
         return f"Failed to list directory: {e}"
@@ -755,7 +757,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_shell_command",
-            "description": "Executes a shell command on the host.",
+            "description": "Run a quick shell command on the local Raspberry Pi. Only for simple local checks (disk space, process status, etc). NOT for multi-step tasks or git operations — use create_agent instead.",
             "parameters": {
                 "type": "object",
                 "properties": {"cmd": {"type": "string"}},
@@ -767,7 +769,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Reads a file from filesystem.",
+            "description": "Read a local file on the Raspberry Pi. For quick config/log checks only.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -779,7 +781,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Writes content to a file.",
+            "description": "Write content to a local file on the Raspberry Pi. For quick local edits only.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -794,7 +796,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_directory",
-            "description": "Lists files in a directory.",
+            "description": "List files in a local directory on the Raspberry Pi. For quick checks only. Never use on system dirs like /usr/bin.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -832,7 +834,7 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_agent",
-            "description": "Spawns an autonomous CLI agent (claude or gemini) to run a complex task like code changes, git operations, etc. The agent runs in background and reports back when done.",
+            "description": "PREFERRED tool for any complex task. Spawns an autonomous CLI agent (claude or gemini) that can clone repos, edit code, run commands, commit, push, etc. Use this for ALL GitHub/code/multi-step tasks. The agent runs autonomously in background and reports back when done. Just give it a clear prompt describing the full task.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -943,9 +945,15 @@ def _build_memory_block(prepared: Dict[str, Any], include_tools_note: bool) -> s
     if include_tools_note:
         tools_note = (
             "\nTool policy:\n"
-            "- Use tools only for explicit system actions.\n"
-            "- Max 2 tool calls per user request.\n"
+            "- IMPORTANT: For any task involving GitHub repos, code changes, multi-step coding, "
+            "or git operations — ALWAYS use create_agent. Never try to do these manually with "
+            "execute_shell_command or list_directory. The agent handles cloning, editing, committing, and pushing autonomously.\n"
+            "- execute_shell_command, read_file, write_file, list_directory are ONLY for quick local tasks "
+            "on the Raspberry Pi (e.g. checking disk space, reading a config file). Never use them for "
+            "complex multi-step work.\n"
+            "- Max 2 tool calls per user request unless the task clearly requires more.\n"
             "- Use tool outputs in final response.\n"
+            "- Do not explore the filesystem to 'check if tools are installed' — just call create_agent directly.\n"
         )
 
     return (
@@ -994,8 +1002,10 @@ async def _call_groq_response(
         _build_identity_prompt(now_str, is_self_initiated)
         + "\n\n"
         + _build_memory_block(prepared, include_tools_note=True)
-        + "\n\nAvailable tools are provided. You act as the harness system orchestrator. "
-        "Use them to perform actions, spawn agent sandboxes, list files, run commands, etc."
+        + "\n\nYou are the orchestrator. You have tools available. "
+        "For complex tasks (code changes, GitHub repos, multi-step work) — delegate to create_agent immediately. "
+        "For simple local queries (disk space, quick file check) — use shell/file tools. "
+        "Never waste turns exploring or verifying before acting."
     )
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -1055,6 +1065,9 @@ async def _call_groq_response(
                                 None,
                                 lambda fn=func_name, fa=func_args: _execute_tool_by_name(fn, fa),
                             )
+                            # Truncate large tool outputs to avoid blowing token limits
+                            if len(result_str) > 2000:
+                                result_str = result_str[:2000] + "\n...(truncated)"
                             tool_called_this_request = True
                             messages.append(
                                 {
