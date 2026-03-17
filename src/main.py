@@ -5,6 +5,7 @@ import logging.handlers
 import os
 import re
 import shlex
+import shutil
 import signal
 import sys
 import tempfile
@@ -631,8 +632,23 @@ async def _run_sandbox_task(agent_id: str) -> None:
         return
 
     cmd_parts = cli_builder(sandbox.initial_prompt)
+    cli_binary = cmd_parts[0]
+
+    # Pre-check: verify the CLI binary exists before spawning
+    if not shutil.which(cli_binary):
+        sandbox.output = (
+            f"Error: '{cli_binary}' is not installed or not in PATH. "
+            f"Install it first (e.g. 'npm install -g @google/gemini-cli' for gemini, "
+            f"or 'npm install -g @anthropic-ai/claude-code' for claude)."
+        )
+        sandbox.state = "finished"
+        sandbox.finished_at = time.time()
+        logger.error(f"Agent {agent_id}: CLI '{cli_binary}' not found in PATH")
+        asyncio.create_task(_report_agent_finished(agent_id))
+        return
+
     cmd_shell = " ".join(shlex.quote(c) for c in cmd_parts)
-    logger.info(f"Agent {agent_id} spawning: {cmd_parts[0]} (prompt: {sandbox.initial_prompt[:80]})")
+    logger.info(f"Agent {agent_id} spawning: {cli_binary} (prompt: {sandbox.initial_prompt[:80]})")
 
     try:
         proc = await asyncio.create_subprocess_shell(
