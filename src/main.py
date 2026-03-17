@@ -4,6 +4,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shlex
 import signal
 import sys
 import tempfile
@@ -608,7 +609,7 @@ AGENT_CLI_COMMANDS: Dict[str, Callable[[str], List[str]]] = {
         "claude", "--print", "--dangerously-skip-permissions", "-p", prompt,
     ],
     "gemini": lambda prompt: [
-        "gemini", "--print", prompt,
+        "gemini", "-p", prompt,
     ],
 }
 
@@ -627,12 +628,13 @@ async def _run_sandbox_task(agent_id: str) -> None:
         asyncio.create_task(_report_agent_finished(agent_id))
         return
 
-    cmd = cli_builder(sandbox.initial_prompt)
-    logger.info(f"Agent {agent_id} spawning: {cmd[0]} (prompt: {sandbox.initial_prompt[:80]})")
+    cmd_parts = cli_builder(sandbox.initial_prompt)
+    cmd_shell = " ".join(shlex.quote(c) for c in cmd_parts)
+    logger.info(f"Agent {agent_id} spawning: {cmd_parts[0]} (prompt: {sandbox.initial_prompt[:80]})")
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        proc = await asyncio.create_subprocess_shell(
+            cmd_shell,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -1139,7 +1141,7 @@ async def generate_response(
         )
     except Exception as groq_error:
         logger.error(f"Groq main call failed: {groq_error}", exc_info=True)
-        return "I hit an upstream model error and Gemini fallback is no longer used. See logs."
+        return "I couldn't generate a response — the model timed out or hit a rate limit. Try again in a moment."
 
 
 async def wake_up_callback(
