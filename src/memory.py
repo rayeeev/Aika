@@ -1,4 +1,4 @@
-import aiosqlite
+import aiosqlite  # type: ignore
 import asyncio
 import json
 import re
@@ -9,11 +9,13 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from zoneinfo import ZoneInfo
-from groq import Groq
+from groq import Groq  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.getenv("AIKA_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "aika.db"))
+DB_PATH = os.getenv(
+    "AIKA_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "aika.db")
+)
 TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 # --- Configuration ---
@@ -23,8 +25,8 @@ CC_SUMMARY_MAX_SENTENCES = 3
 CONVERSATION_SUMMARY_MAX_SENTENCES = 4
 DAY_SUMMARY_MAX_SENTENCES = 3
 GLOBAL_SUMMARY_MAX_SENTENCES = 4
-MAX_EPISODIC_TOKENS = 4000    # Token budget for all episodic memories combined
-MAX_SEMANTIC_TOKENS = 1500    # Token budget for all semantic memories combined
+MAX_EPISODIC_TOKENS = 4000  # Token budget for all episodic memories combined
+MAX_SEMANTIC_TOKENS = 1500  # Token budget for all semantic memories combined
 PRECALL_RECENT_MESSAGES = 20
 PRECALL_MAX_SEMANTIC_CANDIDATES = 24
 PRECALL_MAX_EPISODIC_CANDIDATES = 36
@@ -39,12 +41,12 @@ class Memory:
         self.db_path = db_path
         self.groq_client: Optional[Groq] = None
         self.extraction_model = "qwen/qwen3-32b"
-        self.filter_model = "llama-3.1-8b-instant"
+        self.filter_model = "qwen/qwen3-32b"
         self._lock = asyncio.Lock()
         self._compaction_lock = asyncio.Lock()
         self._sync_lock = threading.Lock()  # For sync tool methods (Gemini AFC)
 
-    def set_groq_client(self, client: Groq):
+    def set_groq_client(self, client: Optional[Groq]):
         self.groq_client = client
 
     # ── Schema ──────────────────────────────────────────────
@@ -108,10 +110,18 @@ class Memory:
                     updated_at REAL NOT NULL
                 )
             """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_conv_closed ON conversations(is_closed)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_episodic_created ON episodic_memories(created_at)")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conv_closed ON conversations(is_closed)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episodic_created ON episodic_memories(created_at)"
+            )
             await db.commit()
 
     # ── Conversation Lifecycle ──────────────────────────────
@@ -132,8 +142,7 @@ class Memory:
                 return 0
 
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
-                (conv_id,)
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conv_id,)
             )
             row = await cursor.fetchone()
             return int(row[0]) if row and row[0] is not None else 0
@@ -142,7 +151,7 @@ class Memory:
         """Get the timestamp of the last message in a conversation."""
         cursor = await db.execute(
             "SELECT timestamp FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
-            (conv_id,)
+            (conv_id,),
         )
         row = await cursor.fetchone()
         return row[0] if row else None
@@ -150,13 +159,12 @@ class Memory:
     async def _create_conversation(self, db, now: float) -> int:
         """Create a new conversation and its empty CC row."""
         cursor = await db.execute(
-            "INSERT INTO conversations (started_at, is_closed) VALUES (?, 0)",
-            (now,)
+            "INSERT INTO conversations (started_at, is_closed) VALUES (?, 0)", (now,)
         )
         conv_id = cursor.lastrowid
         await db.execute(
             "INSERT INTO conversation_context (conversation_id, summary_text, updated_at) VALUES (?, '', ?)",
-            (conv_id, now)
+            (conv_id, now),
         )
         await db.commit()
         logger.info(f"Created new conversation {conv_id}")
@@ -182,7 +190,7 @@ class Memory:
                 # Insert the message
                 await db.execute(
                     "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                    (conv_id, role, content, now)
+                    (conv_id, role, content, now),
                 )
                 await db.commit()
 
@@ -191,11 +199,12 @@ class Memory:
         fold the oldest interaction into the CC summary."""
         # Count total messages in this conversation
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
-            (conv_id,)
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conv_id,)
         )
         total_messages = (await cursor.fetchone())[0]
-        buffer_messages = IMMEDIATE_BUFFER_INTERACTIONS * 2  # 10 interactions = 20 messages
+        buffer_messages = (
+            IMMEDIATE_BUFFER_INTERACTIONS * 2
+        )  # 10 interactions = 20 messages
 
         if total_messages <= buffer_messages:
             return  # Buffer not overflowing
@@ -204,7 +213,7 @@ class Memory:
         overflow_count = total_messages - buffer_messages
         cursor = await db.execute(
             "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-            (conv_id, overflow_count)
+            (conv_id, overflow_count),
         )
         overflow_msgs = await cursor.fetchall()
 
@@ -214,7 +223,7 @@ class Memory:
         # Get current CC summary
         cursor = await db.execute(
             "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-            (conv_id,)
+            (conv_id,),
         )
         row = await cursor.fetchone()
         current_summary = row[0] if row else ""
@@ -227,24 +236,30 @@ class Memory:
         if new_summary:
             await db.execute(
                 "UPDATE conversation_context SET summary_text = ?, updated_at = ? WHERE conversation_id = ?",
-                (new_summary, time.time(), conv_id)
+                (new_summary, time.time(), conv_id),
             )
 
             # Only delete overflow messages if summarization succeeded
             cursor = await db.execute(
                 "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-                (conv_id, overflow_count)
+                (conv_id, overflow_count),
             )
             ids_to_delete = [r[0] for r in await cursor.fetchall()]
             if ids_to_delete:
                 placeholders = ",".join(["?"] * len(ids_to_delete))
-                await db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete)
+                await db.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete
+                )
 
             await db.commit()
         else:
-            logger.warning(f"CC summarization failed for conversation {conv_id} — overflow messages preserved")
+            logger.warning(
+                f"CC summarization failed for conversation {conv_id} — overflow messages preserved"
+            )
 
-    async def _summarize_cc(self, current_summary: str, new_messages: str) -> Optional[str]:
+    async def _summarize_cc(
+        self, current_summary: str, new_messages: str
+    ) -> Optional[str]:
         """Use Groq to fold new messages into the CC summary (max 3 sentences)."""
         if not self.groq_client:
             return None
@@ -273,21 +288,21 @@ class Memory:
         # But we also need the CC summary for messages that were already folded
         cursor = await db.execute(
             "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-            (conv_id,)
+            (conv_id,),
         )
         cc_row = await cursor.fetchone()
         cc_summary = cc_row[0] if cc_row and cc_row[0] else ""
 
         cursor = await db.execute(
             "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
-            (conv_id,)
+            (conv_id,),
         )
         messages = await cursor.fetchall()
 
         if not messages:
             await db.execute(
                 "UPDATE conversations SET is_closed = 1, ended_at = ? WHERE id = ?",
-                (now, conv_id)
+                (now, conv_id),
             )
             await db.commit()
             return
@@ -302,8 +317,7 @@ class Memory:
 
         # Get conversation time range
         cursor = await db.execute(
-            "SELECT started_at FROM conversations WHERE id = ?",
-            (conv_id,)
+            "SELECT started_at FROM conversations WHERE id = ?", (conv_id,)
         )
         started_at = (await cursor.fetchone())[0]
         start_time = datetime.fromtimestamp(started_at, tz=TIMEZONE).strftime("%H:%M")
@@ -312,24 +326,28 @@ class Memory:
         time_interval = f"{date_str} {start_time}–{end_time}"
 
         # Call Groq for summary + episodic extraction (single call)
-        summary, episodic_memories = await self._extract_conversation_close(full_text, time_interval)
+        summary, episodic_memories = await self._extract_conversation_close(
+            full_text, time_interval
+        )
 
         # Store summary
         await db.execute(
             "UPDATE conversations SET is_closed = 1, ended_at = ?, summary = ? WHERE id = ?",
-            (now, summary, conv_id)
+            (now, summary, conv_id),
         )
 
         # Store episodic memories
         for mem in episodic_memories:
             await db.execute(
                 "INSERT INTO episodic_memories (content, conversation_id, created_at) VALUES (?, ?, ?)",
-                (mem, conv_id, now)
+                (mem, conv_id, now),
             )
 
         await self._enforce_memory_limits(db)
         await db.commit()
-        logger.info(f"Closed conversation {conv_id}: {len(episodic_memories)} episodic memories extracted")
+        logger.info(
+            f"Closed conversation {conv_id}: {len(episodic_memories)} episodic memories extracted"
+        )
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -338,12 +356,18 @@ class Memory:
 
     async def _enforce_memory_limits(self, db):
         """Consolidate memories via Groq if total tokens exceed budget."""
-        await self._consolidate_table(db, "episodic_memories", MAX_EPISODIC_TOKENS, "episodic")
-        await self._consolidate_table(db, "semantic_memories", MAX_SEMANTIC_TOKENS, "semantic")
+        await self._consolidate_table(
+            db, "episodic_memories", MAX_EPISODIC_TOKENS, "episodic"
+        )
+        await self._consolidate_table(
+            db, "semantic_memories", MAX_SEMANTIC_TOKENS, "semantic"
+        )
 
     async def _consolidate_table(self, db, table: str, token_budget: int, label: str):
         """Check a memory table's token usage; if over budget, ask Groq to consolidate."""
-        cursor = await db.execute(f"SELECT id, content FROM {table} ORDER BY created_at DESC")
+        cursor = await db.execute(
+            f"SELECT id, content FROM {table} ORDER BY created_at DESC"
+        )
         rows = await cursor.fetchall()
         if not rows:
             return
@@ -352,17 +376,23 @@ class Memory:
         if total_tokens <= token_budget:
             return
 
-        logger.info(f"{label} memories over token budget ({total_tokens}/{token_budget}). Consolidating...")
+        logger.info(
+            f"{label} memories over token budget ({total_tokens}/{token_budget}). Consolidating..."
+        )
 
         if not self.groq_client:
             # No Groq → fall back to deleting oldest until under budget
             running = total_tokens
-            for id_, content in reversed(rows):  # oldest last in DESC order, so reversed = oldest first
+            for id_, content in reversed(
+                rows
+            ):  # oldest last in DESC order, so reversed = oldest first
                 if running <= token_budget:
                     break
                 running -= self._estimate_tokens(content)
                 await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
-            logger.info(f"Pruned {label} memories to ~{running} tokens (no Groq, oldest-first fallback)")
+            logger.info(
+                f"Pruned {label} memories to ~{running} tokens (no Groq, oldest-first fallback)"
+            )
             return
 
         # Build memories text for Groq
@@ -400,7 +430,9 @@ class Memory:
                     break
                 running -= self._estimate_tokens(content)
                 await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
-            logger.info(f"Pruned {label} memories to ~{running} tokens (Groq failed, oldest-first fallback)")
+            logger.info(
+                f"Pruned {label} memories to ~{running} tokens (Groq failed, oldest-first fallback)"
+            )
             return
 
         try:
@@ -412,29 +444,32 @@ class Memory:
             for mem_id_str, new_content in data.get("update", {}).items():
                 await db.execute(
                     f"UPDATE {table} SET content = ? WHERE id = ?",
-                    (str(new_content), int(mem_id_str))
+                    (str(new_content), int(mem_id_str)),
                 )
 
             # Process adds (merged memories)
             import time as _time
+
             now = _time.time()
             for new_mem in data.get("add", []):
                 if isinstance(new_mem, str) and new_mem.strip():
                     if table == "episodic_memories":
                         await db.execute(
                             "INSERT INTO episodic_memories (content, conversation_id, created_at) VALUES (?, NULL, ?)",
-                            (new_mem.strip(), now)
+                            (new_mem.strip(), now),
                         )
                     else:
                         await db.execute(
                             "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
-                            (new_mem.strip(), now)
+                            (new_mem.strip(), now),
                         )
 
-            deleted = len(data.get('delete', []))
-            updated = len(data.get('update', {}))
-            added = len(data.get('add', []))
-            logger.info(f"Consolidated {label} memories: {deleted} deleted, {updated} updated, {added} added")
+            deleted = len(data.get("delete", []))
+            updated = len(data.get("update", {}))
+            added = len(data.get("add", []))
+            logger.info(
+                f"Consolidated {label} memories: {deleted} deleted, {updated} updated, {added} added"
+            )
 
         except (ValueError, KeyError) as e:
             logger.error(f"{label} memory consolidation processing failed: {e}")
@@ -445,9 +480,13 @@ class Memory:
                     break
                 running -= self._estimate_tokens(content)
                 await db.execute(f"DELETE FROM {table} WHERE id = ?", (id_,))
-            logger.info(f"Pruned {label} memories to ~{running} tokens (processing fallback)")
+            logger.info(
+                f"Pruned {label} memories to ~{running} tokens (processing fallback)"
+            )
 
-    async def _extract_conversation_close(self, full_text: str, time_interval: str) -> tuple:
+    async def _extract_conversation_close(
+        self, full_text: str, time_interval: str
+    ) -> tuple:
         """Extract conversation summary + episodic memories via Groq with retry."""
         if not self.groq_client:
             return (f"[{time_interval}] (no summary available)", [])
@@ -470,7 +509,9 @@ class Memory:
         )
 
         if data is None:
-            logger.error(f"Conversation close extraction fully failed for {time_interval}")
+            logger.error(
+                f"Conversation close extraction fully failed for {time_interval}"
+            )
             return (f"[{time_interval}] (extraction failed)", [])
 
         summary = f"[{time_interval}] {data.get('summary', '(no summary)')}"
@@ -492,12 +533,16 @@ class Memory:
 
                 last_ts = await self._get_last_message_time(db, conv_id)
                 if last_ts and (now - last_ts) > CONVERSATION_GAP_SECONDS:
-                    logger.info(f"Closing stale conversation {conv_id} (idle for {int(now - last_ts)}s)")
+                    logger.info(
+                        f"Closing stale conversation {conv_id} (idle for {int(now - last_ts)}s)"
+                    )
                     await self._close_conversation_internal(db, conv_id, now)
 
     # ── Context Retrieval (for prompt assembly) ─────────────
 
-    async def get_conversation_context(self, limit_messages: Optional[int] = None) -> Dict[str, Any]:
+    async def get_conversation_context(
+        self, limit_messages: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Returns CC for the active conversation.
         If limit_messages is provided, returns only the latest N messages."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -507,7 +552,7 @@ class Memory:
 
             cursor = await db.execute(
                 "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-                (conv_id,)
+                (conv_id,),
             )
             row = await cursor.fetchone()
             summary = row[0] if row and row[0] else ""
@@ -516,17 +561,22 @@ class Memory:
                 cursor = await db.execute(
                     "SELECT role, content, timestamp FROM messages "
                     "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
-                    (conv_id, limit_messages)
+                    (conv_id, limit_messages),
                 )
-                fetched = await cursor.fetchall()
+                fetched = list(await cursor.fetchall())
                 fetched.reverse()
-                messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched]
+                messages = [
+                    {"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched
+                ]
             else:
                 cursor = await db.execute(
                     "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id ASC",
-                    (conv_id,)
+                    (conv_id,),
                 )
-                messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in await cursor.fetchall()]
+                messages = [
+                    {"role": r[0], "content": r[1], "timestamp": r[2]}
+                    for r in await cursor.fetchall()
+                ]
 
             return {"summary": summary, "messages": messages}
 
@@ -540,7 +590,7 @@ class Memory:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                (today_epoch,)
+                (today_epoch,),
             )
             rows = await cursor.fetchall()
 
@@ -659,7 +709,7 @@ class Memory:
             if conv_id is not None:
                 cursor = await db.execute(
                     "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-                    (conv_id,)
+                    (conv_id,),
                 )
                 row = await cursor.fetchone()
                 cc_summary = row[0] if row and row[0] else ""
@@ -667,21 +717,27 @@ class Memory:
                 cursor = await db.execute(
                     "SELECT role, content, timestamp FROM messages "
                     "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
-                    (conv_id, max(1, recent_limit))
+                    (conv_id, max(1, recent_limit)),
                 )
-                fetched = await cursor.fetchall()
+                fetched = list(await cursor.fetchall())
                 fetched.reverse()
-                recent_messages = [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched]
+                recent_messages = [
+                    {"role": r[0], "content": r[1], "timestamp": r[2]} for r in fetched
+                ]
 
             cursor = await db.execute(
                 "SELECT summary FROM conversations "
                 "WHERE is_closed = 1 AND started_at >= ? AND summary IS NOT NULL "
                 "ORDER BY started_at DESC LIMIT 6",
-                (today_epoch,)
+                (today_epoch,),
             )
-            today_rows = await cursor.fetchall()
+            today_rows = list(await cursor.fetchall())
             today_rows.reverse()
-            today_summaries = "\n".join(f"- {r[0]}" for r in today_rows) if today_rows else "(No earlier conversations today)"
+            today_summaries = (
+                "\n".join(f"- {r[0]}" for r in today_rows)
+                if today_rows
+                else "(No earlier conversations today)"
+            )
 
             cursor = await db.execute(
                 "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
@@ -691,21 +747,24 @@ class Memory:
 
             cursor = await db.execute(
                 "SELECT id, content FROM semantic_memories ORDER BY created_at DESC LIMIT ?",
-                (PRECALL_MAX_SEMANTIC_CANDIDATES,)
+                (PRECALL_MAX_SEMANTIC_CANDIDATES,),
             )
             semantic_rows = await cursor.fetchall()
 
             cursor = await db.execute(
                 "SELECT id, content FROM episodic_memories ORDER BY created_at DESC LIMIT ?",
-                (PRECALL_MAX_EPISODIC_CANDIDATES,)
+                (PRECALL_MAX_EPISODIC_CANDIDATES,),
             )
             episodic_rows = await cursor.fetchall()
 
-        semantic_candidates = [{"id": r[0], "content": str(r[1])} for r in semantic_rows]
-        episodic_candidates = [{"id": r[0], "content": str(r[1])} for r in episodic_rows]
+        semantic_candidates = [
+            {"id": r[0], "content": str(r[1])} for r in semantic_rows
+        ]
+        episodic_candidates = [
+            {"id": r[0], "content": str(r[1])} for r in episodic_rows
+        ]
 
-        route = {
-            "requires_tools": False,
+        route: Dict[str, Any] = {
             "complexity": "fast",
             "provider_hint": "auto",
             "model_hint": "",
@@ -721,8 +780,12 @@ class Memory:
             "recent_messages": recent_messages,
             "today_summaries": today_summaries,
             "global_summary": global_summary,
-            "selected_semantic": [c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]],
-            "selected_episodic": [c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]],
+            "selected_semantic": [
+                c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]
+            ],
+            "selected_episodic": [
+                c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]
+            ],
             "route": route,
             "_semantic_candidates": semantic_candidates,
             "_episodic_candidates": episodic_candidates,
@@ -732,11 +795,9 @@ class Memory:
         self,
         user_text: str,
         event_type: str = "user",
-        requested_provider: str = "",
-        requested_model: str = "",
-        allowed_models: Optional[List[str]] = None,
+        requested_reasoning: str = "",
     ) -> Dict[str, Any]:
-        """One Groq pre-call for memory selection + routing hints before main inference."""
+        """One Groq pre-call for memory selection + reasoning hints before main inference."""
         base = await self.get_lightweight_inference_context(
             user_text=user_text,
             event_type=event_type,
@@ -752,10 +813,10 @@ class Memory:
         payload = {
             "event_type": event_type,
             "user_text": user_text,
-            "requested_provider": requested_provider,
-            "requested_model": requested_model,
-            "allowed_models": allowed_models or [],
-            "conversation_context_summary": self._truncate_text(base.get("cc_summary", ""), 2400),
+            "requested_reasoning": requested_reasoning,
+            "conversation_context_summary": self._truncate_text(
+                base.get("cc_summary", ""), 2400
+            ),
             "recent_messages": [
                 {
                     "role": m.get("role", ""),
@@ -763,7 +824,9 @@ class Memory:
                 }
                 for m in base.get("recent_messages", [])[-PRECALL_RECENT_MESSAGES:]
             ],
-            "today_summaries": self._truncate_text(base.get("today_summaries", ""), 2400),
+            "today_summaries": self._truncate_text(
+                base.get("today_summaries", ""), 2400
+            ),
             "global_summary": self._truncate_text(base.get("global_summary", ""), 1200),
             "semantic_candidates": [
                 {"id": c["id"], "content": self._truncate_text(c["content"], 220)}
@@ -779,20 +842,16 @@ class Memory:
             "Analyze the payload and prepare compact memory context for the next assistant response.\n"
             "Return ONLY valid JSON with this schema:\n"
             "{"
-            "\"context_summary\":\"string <= 6 sentences\","
-            "\"semantic_ids\":[int,... up to 8],"
-            "\"episodic_ids\":[int,... up to 8],"
-            "\"route\":{"
-            "\"requires_tools\":true/false,"
-            "\"complexity\":\"fast|deep\","
-            "\"provider_hint\":\"auto|groq|gemini\","
-            "\"model_hint\":\"optional model name\""
+            '"context_summary":"string <= 6 sentences",'
+            '"semantic_ids":[int,... up to 8],'
+            '"episodic_ids":[int,... up to 8],'
+            '"route":{'
+            '"reasoning":"low|medium|high"'
             "}"
             "}\n"
             "Selection rules:\n"
             "- Pick ONLY IDs present in candidates.\n"
-            "- If user asks to run commands/read-write files/logs/schedule/manage memory, set requires_tools=true.\n"
-            "- Prefer provider_hint=groq unless tools are clearly required.\n"
+            "- Set reasoning to low, medium, or high depending on task complexity.\n"
             "- context_summary must be concise and directly useful.\n\n"
             f"Payload JSON:\n{json.dumps(payload, ensure_ascii=False)}"
         )
@@ -813,50 +872,42 @@ class Memory:
         semantic_map = {c["id"]: c["content"] for c in semantic_candidates}
         episodic_map = {c["id"]: c["content"] for c in episodic_candidates}
 
-        selected_semantic = [semantic_map[mid] for mid in semantic_ids if mid in semantic_map][:PRECALL_SELECTION_LIMIT]
-        selected_episodic = [episodic_map[mid] for mid in episodic_ids if mid in episodic_map][:PRECALL_SELECTION_LIMIT]
+        selected_semantic = [
+            semantic_map[mid] for mid in semantic_ids if mid in semantic_map
+        ][:PRECALL_SELECTION_LIMIT]
+        selected_episodic = [
+            episodic_map[mid] for mid in episodic_ids if mid in episodic_map
+        ][:PRECALL_SELECTION_LIMIT]
 
         if not selected_semantic:
-            selected_semantic = [c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]]
+            selected_semantic = [
+                c["content"] for c in semantic_candidates[:PRECALL_SELECTION_LIMIT]
+            ]
         if not selected_episodic:
-            selected_episodic = [c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]]
+            selected_episodic = [
+                c["content"] for c in episodic_candidates[:PRECALL_SELECTION_LIMIT]
+            ]
 
         route_raw = data.get("route", {}) if isinstance(data.get("route"), dict) else {}
-        complexity = str(route_raw.get("complexity", "fast")).strip().lower()
-        if complexity not in {"fast", "deep"}:
-            complexity = "fast"
+        reasoning = str(route_raw.get("reasoning", "medium")).strip().lower()
+        if reasoning not in {"low", "medium", "high"}:
+            reasoning = "medium"
 
-        provider_hint = str(route_raw.get("provider_hint", "auto")).strip().lower()
-        if provider_hint not in {"auto", "groq", "gemini"}:
-            provider_hint = "auto"
-
-        requires_tools_raw = route_raw.get("requires_tools", False)
-        if isinstance(requires_tools_raw, bool):
-            requires_tools = requires_tools_raw
-        elif isinstance(requires_tools_raw, str):
-            requires_tools = requires_tools_raw.strip().lower() in {"true", "1", "yes", "y"}
-        else:
-            requires_tools = bool(requires_tools_raw)
-
-        model_hint = str(route_raw.get("model_hint", "")).strip()
-        if allowed_models:
-            allowed_lookup = {m.lower(): m for m in allowed_models}
-            model_hint = allowed_lookup.get(model_hint.lower(), "")
-
-        context_summary = str(data.get("context_summary", "")).strip() or base.get("context_summary", "")
+        context_summary = str(data.get("context_summary", "")).strip() or base.get(
+            "context_summary", ""
+        )
         base["context_summary"] = context_summary
         base["selected_semantic"] = selected_semantic
         base["selected_episodic"] = selected_episodic
         base["route"] = {
-            "requires_tools": requires_tools,
-            "complexity": complexity,
-            "provider_hint": provider_hint,
-            "model_hint": model_hint,
+            "reasoning": reasoning,
         }
 
         return self._finalize_inference_context(base)
 
-    async def compact_conversation_context_if_due(self, keep_last: int = COMPACTION_KEEP_DEFAULT) -> bool:
+    async def compact_conversation_context_if_due(
+        self, keep_last: int = COMPACTION_KEEP_DEFAULT
+    ) -> bool:
         """Fold older messages into CC summary, keeping the most recent 15-20 messages."""
         if not self.groq_client:
             return False
@@ -873,9 +924,10 @@ class Memory:
 
                     cursor = await db.execute(
                         "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
-                        (conv_id,)
+                        (conv_id,),
                     )
-                    total_messages = (await cursor.fetchone())[0]
+                    row = await cursor.fetchone()
+                    total_messages = row[0] if row else 0
                     if total_messages <= keep_last:
                         return False
 
@@ -883,7 +935,7 @@ class Memory:
                     cursor = await db.execute(
                         "SELECT id, role, content FROM messages "
                         "WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-                        (conv_id, overflow_count)
+                        (conv_id, overflow_count),
                     )
                     overflow_rows = await cursor.fetchall()
                     if not overflow_rows:
@@ -891,7 +943,7 @@ class Memory:
 
                     cursor = await db.execute(
                         "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-                        (conv_id,)
+                        (conv_id,),
                     )
                     row = await cursor.fetchone()
                     current_summary = row[0] if row and row[0] else ""
@@ -901,7 +953,9 @@ class Memory:
             )
             new_summary = await self._summarize_cc(current_summary, overflow_text)
             if not new_summary:
-                logger.warning(f"Background CC compaction failed for conversation {conv_id}")
+                logger.warning(
+                    f"Background CC compaction failed for conversation {conv_id}"
+                )
                 return False
 
             ids_to_delete = [row[0] for row in overflow_rows]
@@ -913,20 +967,20 @@ class Memory:
 
                     await db.execute(
                         "UPDATE conversation_context SET summary_text = ?, updated_at = ? WHERE conversation_id = ?",
-                        (new_summary, time.time(), conv_id)
+                        (new_summary, time.time(), conv_id),
                     )
 
                     placeholders = ",".join(["?"] * len(ids_to_delete))
                     cursor = await db.execute(
                         f"SELECT id FROM messages WHERE id IN ({placeholders})",
-                        ids_to_delete
+                        ids_to_delete,
                     )
                     existing_ids = [r[0] for r in await cursor.fetchall()]
                     if existing_ids:
                         del_placeholders = ",".join(["?"] * len(existing_ids))
                         await db.execute(
                             f"DELETE FROM messages WHERE id IN ({del_placeholders})",
-                            existing_ids
+                            existing_ids,
                         )
 
                     await db.commit()
@@ -954,7 +1008,7 @@ class Memory:
             # Get all conversation summaries from yesterday
             cursor = await db.execute(
                 "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                (day_start.timestamp(), day_end.timestamp())
+                (day_start.timestamp(), day_end.timestamp()),
             )
             conv_summaries = [r[0] for r in await cursor.fetchall()]
 
@@ -980,7 +1034,7 @@ class Memory:
                 full_day_summary = f"[{date_str}] {day_summary}"
                 await db.execute(
                     "INSERT OR REPLACE INTO day_memories (date, summary) VALUES (?, ?)",
-                    (date_str, full_day_summary)
+                    (date_str, full_day_summary),
                 )
                 logger.info(f"Created day memory for {date_str}")
 
@@ -998,7 +1052,11 @@ class Memory:
 
             if episodic_rows:
                 episodic_text = "\n".join(f"[{r[0]}] {r[1]}" for r in episodic_rows)
-                existing_text = "\n".join(f"• {s}" for s in existing_semantic) if existing_semantic else "(none)"
+                existing_text = (
+                    "\n".join(f"• {s}" for s in existing_semantic)
+                    if existing_semantic
+                    else "(none)"
+                )
                 sem_prompt = (
                     f"Here are recent episodic memories:\n\n{episodic_text}\n\n"
                     f"Here are EXISTING semantic memories (DO NOT duplicate these):\n{existing_text}\n\n"
@@ -1024,11 +1082,13 @@ class Memory:
                         if isinstance(mem, str) and mem.strip():
                             await db.execute(
                                 "INSERT INTO semantic_memories (content, created_at) VALUES (?, ?)",
-                                (mem.strip(), now)
+                                (mem.strip(), now),
                             )
                             count += 1
                     if count:
-                        logger.info(f"Created {count} semantic memories from episodic analysis")
+                        logger.info(
+                            f"Created {count} semantic memories from episodic analysis"
+                        )
 
             await self._enforce_memory_limits(db)
             await db.commit()
@@ -1044,8 +1104,7 @@ class Memory:
         async with aiosqlite.connect(self.db_path) as db:
             # Get latest day memory
             cursor = await db.execute(
-                "SELECT summary FROM day_memories WHERE date = ?",
-                (date_str,)
+                "SELECT summary FROM day_memories WHERE date = ?", (date_str,)
             )
             day_row = await cursor.fetchone()
             if not day_row:
@@ -1085,12 +1144,12 @@ class Memory:
                 if global_row:
                     await db.execute(
                         "UPDATE global_memory SET summary = ?, updated_at = ? WHERE id = (SELECT id FROM global_memory ORDER BY id DESC LIMIT 1)",
-                        (new_global, now)
+                        (new_global, now),
                     )
                 else:
                     await db.execute(
                         "INSERT INTO global_memory (summary, updated_at) VALUES (?, ?)",
-                        (new_global, now)
+                        (new_global, now),
                     )
                 await db.commit()
                 logger.info("Updated global memory")
@@ -1133,7 +1192,7 @@ class Memory:
                 "3. Episodic memories that can be merged\n\n"
                 "Return JSON (no markdown):\n"
                 '{"delete_ids": ["E1", "S3", ...], "reason": "short explanation"}\n'
-                "If nothing needs cleanup, return: {\"delete_ids\": [], \"reason\": \"all clean\"}"
+                'If nothing needs cleanup, return: {"delete_ids": [], "reason": "all clean"}'
             )
             data = await self._call_groq_json(
                 prompt,
@@ -1155,23 +1214,31 @@ class Memory:
                 if id_str.startswith("E"):
                     try:
                         mem_id = int(id_str[1:])
-                        await db.execute("DELETE FROM episodic_memories WHERE id = ?", (mem_id,))
+                        await db.execute(
+                            "DELETE FROM episodic_memories WHERE id = ?", (mem_id,)
+                        )
                     except ValueError:
                         continue
                 elif id_str.startswith("S"):
                     try:
                         mem_id = int(id_str[1:])
-                        await db.execute("DELETE FROM semantic_memories WHERE id = ?", (mem_id,))
+                        await db.execute(
+                            "DELETE FROM semantic_memories WHERE id = ?", (mem_id,)
+                        )
                     except ValueError:
                         continue
 
             await db.commit()
             reason = data.get("reason", "")
-            logger.info(f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}")
+            logger.info(
+                f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}"
+            )
 
     # ── Recall Memory (Tool) ───────────────────────────────
 
-    async def recall_memory(self, query_type: str, date: str = "", time_range: str = "") -> str:
+    async def recall_memory(
+        self, query_type: str, date: str = "", time_range: str = ""
+    ) -> str:
         """Retrieve stored memories for the user.
         query_type: 'conversation' | 'day' | 'global'
         date: YYYY-MM-DD (required for 'conversation' and 'day')
@@ -1189,8 +1256,7 @@ class Memory:
                 if not date:
                     return "Error: date is required for day query (format: YYYY-MM-DD)"
                 cursor = await db.execute(
-                    "SELECT summary FROM day_memories WHERE date = ?",
-                    (date,)
+                    "SELECT summary FROM day_memories WHERE date = ?", (date,)
                 )
                 row = await cursor.fetchone()
                 if row:
@@ -1198,16 +1264,21 @@ class Memory:
 
                 # Fallback: get conversation summaries for that day
                 try:
-                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
+                        tzinfo=TIMEZONE
+                    )
                     day_start = day_dt.timestamp()
                     day_end = (day_dt + timedelta(days=1)).timestamp()
                     cursor = await db.execute(
                         "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                        (day_start, day_end)
+                        (day_start, day_end),
                     )
                     rows = await cursor.fetchall()
                     if rows:
-                        return "No day summary yet, but here are the conversation summaries:\n" + "\n".join(f"- {r[0]}" for r in rows)
+                        return (
+                            "No day summary yet, but here are the conversation summaries:\n"
+                            + "\n".join(f"- {r[0]}" for r in rows)
+                        )
                 except ValueError:
                     return f"Invalid date format: {date}. Use YYYY-MM-DD."
                 return f"No memories found for {date}."
@@ -1219,9 +1290,13 @@ class Memory:
                     # Parse time range
                     parts = time_range.split("-")
                     if len(parts) != 2:
-                        return f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
+                        return (
+                            f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
+                        )
                     start_str, end_str = parts
-                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
+                        tzinfo=TIMEZONE
+                    )
                     sh, sm = map(int, start_str.strip().split(":"))
                     eh, em = map(int, end_str.strip().split(":"))
                     range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
@@ -1229,12 +1304,14 @@ class Memory:
 
                     cursor = await db.execute(
                         "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                        (range_start, range_end)
+                        (range_start, range_end),
                     )
                     rows = await cursor.fetchall()
                     if rows:
                         return "\n\n".join(r[0] for r in rows)
-                    return f"No conversations found in time range {time_range} on {date}."
+                    return (
+                        f"No conversations found in time range {time_range} on {date}."
+                    )
                 except (ValueError, IndexError) as e:
                     return f"Error parsing query: {e}"
             else:
@@ -1242,7 +1319,9 @@ class Memory:
 
     # ── Groq Helpers ────────────────────────────────────────
 
-    async def _call_groq(self, prompt: str, system: str, model: str, temperature: float = 0.3) -> Optional[str]:
+    async def _call_groq(
+        self, prompt: str, system: str, model: str, temperature: float = 0.3
+    ) -> Optional[str]:
         """Call Groq API in a thread executor. Returns cleaned text or None."""
         if not self.groq_client:
             return None
@@ -1252,7 +1331,7 @@ class Memory:
                 response = self.groq_client.chat.completions.create(
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ],
                     model=model,
                     temperature=temperature,
@@ -1260,11 +1339,11 @@ class Memory:
                 raw = response.choices[0].message.content or ""
                 raw = raw.strip()
                 # Strip <think>...</think> blocks (qwen3 thinking)
-                raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
                 # Strip markdown code fences
                 if raw.startswith("```"):
-                    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                    raw = re.sub(r'\s*```$', '', raw)
+                    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                    raw = re.sub(r"\s*```$", "", raw)
                 return raw if raw else None
             except Exception as e:
                 logger.error(f"Groq call failed ({model}): {e}")
@@ -1273,8 +1352,14 @@ class Memory:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _sync_call)
 
-    async def _call_groq_json(self, prompt: str, system: str, model: str,
-                              temperature: float = 0.3, max_retries: int = 2) -> Optional[Any]:
+    async def _call_groq_json(
+        self,
+        prompt: str,
+        system: str,
+        model: str,
+        temperature: float = 0.3,
+        max_retries: int = 2,
+    ) -> Optional[Any]:
         """Call Groq and parse as JSON, with retry on parse failure.
         On failure, feeds the error back to Groq so it can correct its output.
         Returns parsed JSON (dict or list) or None after all retries exhausted."""
@@ -1283,10 +1368,11 @@ class Memory:
 
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
 
         for attempt in range(1 + max_retries):
+
             def _sync_call(msgs=messages[:]):
                 try:
                     response = self.groq_client.chat.completions.create(
@@ -1297,14 +1383,18 @@ class Memory:
                     raw = response.choices[0].message.content or ""
                     raw = raw.strip()
                     # Strip <think>...</think> blocks (qwen3 thinking)
-                    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                    raw = re.sub(
+                        r"<think>.*?</think>", "", raw, flags=re.DOTALL
+                    ).strip()
                     # Strip markdown code fences
                     if raw.startswith("```"):
-                        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                        raw = re.sub(r'\s*```$', '', raw)
+                        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                        raw = re.sub(r"\s*```$", "", raw)
                     return raw if raw else None
                 except Exception as e:
-                    logger.error(f"Groq JSON call failed ({model}, attempt {attempt + 1}): {e}")
+                    logger.error(
+                        f"Groq JSON call failed ({model}, attempt {attempt + 1}): {e}"
+                    )
                     return None
 
             loop = asyncio.get_running_loop()
@@ -1312,18 +1402,26 @@ class Memory:
 
             if raw is None:
                 if attempt < max_retries:
-                    logger.warning(f"Groq returned empty response (attempt {attempt + 1}/{1 + max_retries}), retrying...")
+                    logger.warning(
+                        f"Groq returned empty response (attempt {attempt + 1}/{1 + max_retries}), retrying..."
+                    )
                     # Add error feedback for retry (use placeholder, not empty string)
-                    messages.append({"role": "assistant", "content": "(empty response)"})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Your previous response was EMPTY. I need valid JSON output. "
-                            "Please try again and return ONLY valid JSON, no markdown, no explanation."
-                        )
-                    })
+                    messages.append(
+                        {"role": "assistant", "content": "(empty response)"}
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response was EMPTY. I need valid JSON output. "
+                                "Please try again and return ONLY valid JSON, no markdown, no explanation."
+                            ),
+                        }
+                    )
                     continue
-                logger.error(f"Groq returned empty response after {1 + max_retries} attempts")
+                logger.error(
+                    f"Groq returned empty response after {1 + max_retries} attempts"
+                )
                 return None
 
             try:
@@ -1339,14 +1437,16 @@ class Memory:
                     )
                     # Feed the error back to Groq so it can fix its output
                     messages.append({"role": "assistant", "content": raw[:500]})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"Your response is NOT valid JSON. Parse error: {e}\n"
-                            "Please fix your output and return ONLY valid JSON. "
-                            "No markdown code fences, no explanation, no text before or after the JSON."
-                        )
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your response is NOT valid JSON. Parse error: {e}\n"
+                                "Please fix your output and return ONLY valid JSON. "
+                                "No markdown code fences, no explanation, no text before or after the JSON."
+                            ),
+                        }
+                    )
                 else:
                     logger.error(
                         f"Groq JSON parse failed after {1 + max_retries} attempts. "
@@ -1372,9 +1472,12 @@ class Memory:
 
     # ── Sync Methods (for Gemini AFC tools) ────────────────
 
-    def recall_memory_sync(self, query_type: str, date: str = "", time_range: str = "") -> str:
+    def recall_memory_sync(
+        self, query_type: str, date: str = "", time_range: str = ""
+    ) -> str:
         """Sync version of recall_memory — uses plain sqlite3 so it's safe inside AFC."""
         import sqlite3
+
         with self._sync_lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -1386,22 +1489,29 @@ class Memory:
 
                 elif query_type == "day":
                     if not date:
-                        return "Error: date is required for day query (format: YYYY-MM-DD)"
+                        return (
+                            "Error: date is required for day query (format: YYYY-MM-DD)"
+                        )
                     row = conn.execute(
                         "SELECT summary FROM day_memories WHERE date = ?", (date,)
                     ).fetchone()
                     if row:
                         return row[0]
                     try:
-                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
+                            tzinfo=TIMEZONE
+                        )
                         day_start = day_dt.timestamp()
                         day_end = (day_dt + timedelta(days=1)).timestamp()
                         rows = conn.execute(
                             "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                            (day_start, day_end)
+                            (day_start, day_end),
                         ).fetchall()
                         if rows:
-                            return "No day summary yet, but here are the conversation summaries:\n" + "\n".join(f"- {r[0]}" for r in rows)
+                            return (
+                                "No day summary yet, but here are the conversation summaries:\n"
+                                + "\n".join(f"- {r[0]}" for r in rows)
+                            )
                     except ValueError:
                         return f"Invalid date format: {date}. Use YYYY-MM-DD."
                     return f"No memories found for {date}."
@@ -1414,14 +1524,16 @@ class Memory:
                         if len(parts) != 2:
                             return f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
                         start_str, end_str = parts
-                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
+                            tzinfo=TIMEZONE
+                        )
                         sh, sm = map(int, start_str.strip().split(":"))
                         eh, em = map(int, end_str.strip().split(":"))
                         range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
                         range_end = day_dt.replace(hour=eh, minute=em).timestamp()
                         rows = conn.execute(
                             "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                            (range_start, range_end)
+                            (range_start, range_end),
                         ).fetchall()
                         if rows:
                             return "\n\n".join(r[0] for r in rows)
@@ -1436,6 +1548,7 @@ class Memory:
     def list_memories_sync(self, memory_type: str) -> str:
         """List episodic or semantic memories with their IDs."""
         import sqlite3
+
         with self._sync_lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -1447,10 +1560,15 @@ class Memory:
                         return "No episodic memories stored."
                     parts = []
                     for id_, content, created_at in rows:
-                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M")
+                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
                         parts.append(f"[E{id_}] ({dt}) {content}")
                     total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
-                    return f"Episodic memories ({len(rows)} items, ~{total_tokens}/{MAX_EPISODIC_TOKENS} tokens):\n" + "\n".join(parts)
+                    return (
+                        f"Episodic memories ({len(rows)} items, ~{total_tokens}/{MAX_EPISODIC_TOKENS} tokens):\n"
+                        + "\n".join(parts)
+                    )
 
                 elif memory_type == "semantic":
                     rows = conn.execute(
@@ -1460,10 +1578,15 @@ class Memory:
                         return "No semantic memories stored."
                     parts = []
                     for id_, content, created_at in rows:
-                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M")
+                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
                         parts.append(f"[S{id_}] ({dt}) {content}")
                     total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
-                    return f"Semantic memories ({len(rows)} items, ~{total_tokens}/{MAX_SEMANTIC_TOKENS} tokens):\n" + "\n".join(parts)
+                    return (
+                        f"Semantic memories ({len(rows)} items, ~{total_tokens}/{MAX_SEMANTIC_TOKENS} tokens):\n"
+                        + "\n".join(parts)
+                    )
                 else:
                     return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
             finally:
@@ -1472,19 +1595,28 @@ class Memory:
     def delete_memory_sync(self, memory_type: str, memory_id: int) -> str:
         """Delete a specific episodic or semantic memory by ID."""
         import sqlite3
+
         with self._sync_lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 if memory_type == "episodic":
-                    if not conn.execute("SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)).fetchone():
+                    if not conn.execute(
+                        "SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)
+                    ).fetchone():
                         return f"Episodic memory E{memory_id} not found."
-                    conn.execute("DELETE FROM episodic_memories WHERE id = ?", (memory_id,))
+                    conn.execute(
+                        "DELETE FROM episodic_memories WHERE id = ?", (memory_id,)
+                    )
                     conn.commit()
                     return f"Deleted episodic memory E{memory_id}."
                 elif memory_type == "semantic":
-                    if not conn.execute("SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)).fetchone():
+                    if not conn.execute(
+                        "SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)
+                    ).fetchone():
                         return f"Semantic memory S{memory_id} not found."
-                    conn.execute("DELETE FROM semantic_memories WHERE id = ?", (memory_id,))
+                    conn.execute(
+                        "DELETE FROM semantic_memories WHERE id = ?", (memory_id,)
+                    )
                     conn.commit()
                     return f"Deleted semantic memory S{memory_id}."
                 else:
@@ -1492,22 +1624,35 @@ class Memory:
             finally:
                 conn.close()
 
-    def edit_memory_sync(self, memory_type: str, memory_id: int, new_content: str) -> str:
+    def edit_memory_sync(
+        self, memory_type: str, memory_id: int, new_content: str
+    ) -> str:
         """Edit the content of a specific episodic or semantic memory."""
         import sqlite3
+
         with self._sync_lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 if memory_type == "episodic":
-                    if not conn.execute("SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)).fetchone():
+                    if not conn.execute(
+                        "SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)
+                    ).fetchone():
                         return f"Episodic memory E{memory_id} not found."
-                    conn.execute("UPDATE episodic_memories SET content = ? WHERE id = ?", (new_content, memory_id))
+                    conn.execute(
+                        "UPDATE episodic_memories SET content = ? WHERE id = ?",
+                        (new_content, memory_id),
+                    )
                     conn.commit()
                     return f"Updated episodic memory E{memory_id}."
                 elif memory_type == "semantic":
-                    if not conn.execute("SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)).fetchone():
+                    if not conn.execute(
+                        "SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)
+                    ).fetchone():
                         return f"Semantic memory S{memory_id} not found."
-                    conn.execute("UPDATE semantic_memories SET content = ? WHERE id = ?", (new_content, memory_id))
+                    conn.execute(
+                        "UPDATE semantic_memories SET content = ? WHERE id = ?",
+                        (new_content, memory_id),
+                    )
                     conn.commit()
                     return f"Updated semantic memory S{memory_id}."
                 else:

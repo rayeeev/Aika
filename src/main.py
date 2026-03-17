@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
@@ -6,11 +7,13 @@ import re
 import signal
 import sys
 import tempfile
+import uuid
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, types
@@ -28,36 +31,33 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
-ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ALLOWED_USER_ID_ENV = os.getenv("ALLOWED_USER_ID")
+GROQ_API_KEYS_RAW = os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", ""))
 SEND_STARTUP_MESSAGE = os.getenv("AIKA_STARTUP_MESSAGE", "true").lower() == "true"
 
-# Parse multiple Gemini API keys
+# Parse API keys
 GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_RAW.split(",") if key.strip()]
+GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEYS_RAW.split(",") if key.strip()]
 
 # Routing + latency configuration
-PRECALL_TIMEOUT_SECONDS = 2.5
+PRECALL_TIMEOUT_SECONDS = 4.0
 MAIN_TIMEOUT_SECONDS = 9.0
 FALLBACK_TIMEOUT_SECONDS = 9.0
 GENERATION_CAP_SECONDS = 24.0
 DEBOUNCE_SECONDS = 0.8
+DEFAULT_TEMPERATURE = 0.7
 
 COMPACTION_EVERY_TURNS = 5
 MIN_MESSAGES_FOR_COMPACTION = 15
 CC_KEEP_LAST_MESSAGES = COMPACTION_KEEP_DEFAULT
 
-# Hardcoded Groq allowlist (prompt-requested model must be in this list)
-GROQ_MODEL_ALLOWLIST = [
+# Models fallback chain
+TARGET_MODELS = [
     "openai/gpt-oss-120b",
-    "llama-3.1-8b-instant",
-    "groq/compound",
     "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
     "moonshotai/kimi-k2-instruct-0905",
 ]
-DEFAULT_GROQ_MODEL_FAST = "llama-3.1-8b-instant"
-DEFAULT_GROQ_MODEL_DEEP = "qwen/qwen3-32b"
-DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
 
 # --- Logging Setup ---
 LOG_FILE = Path(os.path.dirname(os.path.dirname(__file__))) / "aika.log"
@@ -73,22 +73,28 @@ logging.basicConfig(
 file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=512 * 1024, backupCount=2
 )
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+)
 logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 
-if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    logger.error("Missing TELEGRAM_BOT_TOKEN or GROQ_API_KEY")
+if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEYS:
+    logger.error("Missing TELEGRAM_BOT_TOKEN or GROQ_API_KEYS")
     sys.exit(1)
 
 if not GEMINI_API_KEYS:
-    logger.warning("No GEMINI_API_KEYS configured. Gemini fallback will be unavailable.")
+    logger.warning(
+        "No GEMINI_API_KEYS configured. Gemini fallback will be unavailable."
+    )
 else:
     logger.info(f"Loaded {len(GEMINI_API_KEYS)} Gemini API key(s)")
 
 try:
-    ALLOWED_USER_ID = int(ALLOWED_USER_ID)
+    ALLOWED_USER_ID = int(ALLOWED_USER_ID_ENV) if ALLOWED_USER_ID_ENV else 0
+    if not ALLOWED_USER_ID:
+        raise ValueError
 except (TypeError, ValueError):
     logger.error("ALLOWED_USER_ID must be set and be an integer")
     sys.exit(1)
@@ -104,11 +110,15 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 memory = Memory()
-groq_client = Groq(api_key=GROQ_API_KEY)
-memory.set_groq_client(groq_client)
+groq_clients = [Groq(api_key=key) for key in GROQ_API_KEYS]
+memory.set_groq_client(groq_clients[0] if groq_clients else None)
 
 # Track scheduled wake-up jobs
 scheduled_jobs: Dict[str, Dict[str, str]] = {}
+
+# Store loop state for sync wrappers
+main_loop: Optional[asyncio.AbstractEventLoop] = None
+
 
 # Track whether any side-effecting tool was called during current Gemini AFC cycle.
 _tool_called_this_cycle = False
@@ -132,34 +142,40 @@ proactive_chain_id = 0
 user_activity_counter = 0
 
 # Initialize Gemini Clients for each API key
-gemini_clients: List[genai.Client] = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
+gemini_clients: List[genai.Client] = [
+    genai.Client(api_key=key) for key in GEMINI_API_KEYS
+]
 
-MODEL_LOOKUP = {model.lower(): model for model in GROQ_MODEL_ALLOWLIST}
-CONTROL_TAG_RE = re.compile(r"\[(MODEL|PROVIDER|REASONING)\s*=\s*([^\]]+)\]", re.IGNORECASE)
-TOOL_INTENT_RE = re.compile(
-    r"\b(run|execute|command|shell|terminal|bash|ssh|read file|write file|edit file|"
-    r"list directory|logs?|disk|cpu|memory usage|schedule|remind|wake up|delete memory|edit memory)\b",
-    re.IGNORECASE,
-)
+
+@dataclass
+class AgentSandbox:
+    id: str
+    model: str
+    mode: str
+    initial_prompt: str
+    state: str  # "running" or "finished"
+    created_at: float
+    finished_at: float
+    task: Optional[asyncio.Task] = None
+    history: List[genai_types.Content] = field(default_factory=list)
+    inbox: List[str] = field(default_factory=list)
+
+
+active_sandboxes: Dict[str, AgentSandbox] = {}
+
+
+CONTROL_TAG_RE = re.compile(r"\[(REASONING)\s*=\s*([^\]]+)\]", re.IGNORECASE)
 
 
 @dataclass
 class PromptControls:
     clean_text: str
-    requested_provider: str = ""
-    requested_model: str = ""
     reasoning: str = ""
 
 
 def _strip_thinking_blocks(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return text
-
-
-def _normalize_groq_model(name: str) -> str:
-    if not name:
-        return ""
-    return MODEL_LOOKUP.get(name.strip().lower(), "")
 
 
 def _mark_tool_called() -> None:
@@ -181,7 +197,9 @@ async def _register_turn(event_name: str) -> None:
         return
 
     if compaction_task and not compaction_task.done():
-        logger.info("Background compaction already running; skipping duplicate schedule")
+        logger.info(
+            "Background compaction already running; skipping duplicate schedule"
+        )
         return
 
     try:
@@ -199,7 +217,9 @@ async def _register_turn(event_name: str) -> None:
 
     async def _run_compaction():
         try:
-            compacted = await memory.compact_conversation_context_if_due(keep_last=CC_KEEP_LAST_MESSAGES)
+            compacted = await memory.compact_conversation_context_if_due(
+                keep_last=CC_KEEP_LAST_MESSAGES
+            )
             logger.info(f"Background compaction completed: compacted={compacted}")
         except Exception as e:
             logger.error(f"Background compaction failed: {e}", exc_info=True)
@@ -224,13 +244,20 @@ async def _record_user_activity(reason: str) -> None:
         await _cancel_proactive_task_locked(f"user activity ({reason})")
 
 
-async def _proactive_chain_is_still_valid(chain_id: int, snapshot_user_counter: int) -> bool:
+async def _proactive_chain_is_still_valid(
+    chain_id: int, snapshot_user_counter: int
+) -> bool:
     async with proactive_state_lock:
-        return chain_id == proactive_chain_id and snapshot_user_counter == user_activity_counter
+        return (
+            chain_id == proactive_chain_id
+            and snapshot_user_counter == user_activity_counter
+        )
 
 
 async def _decide_proactive_thought(stage: int) -> Optional[str]:
     """Return proactive thought text or None if no proactive message should be sent."""
+    if not hasattr(Memory, "_call_groq"):
+        return None
     cc = await memory.get_conversation_context(limit_messages=8)
     recent_msgs = cc["messages"][-8:]
     if not recent_msgs:
@@ -249,7 +276,7 @@ async def _decide_proactive_thought(stage: int) -> Optional[str]:
     loop = asyncio.get_running_loop()
     completion = await loop.run_in_executor(
         None,
-        lambda: groq_client.chat.completions.create(
+        lambda: groq_clients[0].chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.1-8b-instant",
             temperature=0.35,
@@ -277,7 +304,9 @@ async def _run_proactive_chain(
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            if not await _proactive_chain_is_still_valid(chain_id, snapshot_user_counter):
+            if not await _proactive_chain_is_still_valid(
+                chain_id, snapshot_user_counter
+            ):
                 logger.info(
                     f"Proactive chain {chain_id} stopped before stage {stage}: user activity or newer chain"
                 )
@@ -285,7 +314,9 @@ async def _run_proactive_chain(
 
             thought = await _decide_proactive_thought(stage)
             if not thought:
-                logger.info(f"Proactive chain {chain_id} stage {stage}: no proactive action")
+                logger.info(
+                    f"Proactive chain {chain_id} stage {stage}: no proactive action"
+                )
                 return
 
             response_text = await generate_response(
@@ -295,10 +326,14 @@ async def _run_proactive_chain(
             )
 
             if not response_text or response_text.strip() == "[SILENCE]":
-                logger.info(f"Proactive chain {chain_id} stage {stage}: model chose silence")
+                logger.info(
+                    f"Proactive chain {chain_id} stage {stage}: model chose silence"
+                )
                 return
 
-            if not await _proactive_chain_is_still_valid(chain_id, snapshot_user_counter):
+            if not await _proactive_chain_is_still_valid(
+                chain_id, snapshot_user_counter
+            ):
                 logger.info(
                     f"Proactive chain {chain_id} dropped output at stage {stage}: user activity or newer chain"
                 )
@@ -306,7 +341,9 @@ async def _run_proactive_chain(
 
             await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
             await _register_turn("assistant_reply_proactive")
-            asyncio.create_task(_store_messages(f"[PROACTIVE: {thought}]", response_text))
+            asyncio.create_task(
+                _store_messages(f"[PROACTIVE: {thought}]", response_text)
+            )
 
             # Only schedule another proactive check after the first proactive output.
             if stage >= PROACTIVE_MAX_OUTPUTS:
@@ -347,13 +384,14 @@ async def _schedule_proactive_chain(source: str, immediate: bool) -> None:
 
 # --- Audio Transcription ---
 
+
 async def transcribe_audio(file_path: Path) -> Optional[str]:
     """Transcribes audio using Groq Whisper."""
 
     def _transcribe() -> Optional[str]:
         try:
             with open(file_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(
+                transcription = groq_clients[0].audio.transcriptions.create(
                     file=audio_file,
                     model="whisper-large-v3-turbo",
                     response_format="text",
@@ -362,7 +400,9 @@ async def transcribe_audio(file_path: Path) -> Optional[str]:
                 return transcription.strip()
             if hasattr(transcription, "text"):
                 return str(transcription.text).strip()
-            logger.error(f"Unexpected transcription response type: {type(transcription)}")
+            logger.error(
+                f"Unexpected transcription response type: {type(transcription)}"
+            )
             return None
         except Exception as e:
             logger.error(f"Transcription error: {e}", exc_info=True)
@@ -378,6 +418,8 @@ async def download_voice_message(message: Message) -> Optional[Path]:
         voice = message.voice
         if not voice:
             return None
+        if not message.from_user:
+            return None
 
         file = await bot.get_file(voice.file_id)
         if not file.file_path:
@@ -389,7 +431,9 @@ async def download_voice_message(message: Message) -> Optional[Path]:
         if file_extension.lower() == ".oga":
             file_extension = ".ogg"
 
-        local_path = AUDIO_TEMP_DIR / f"voice_{message.from_user.id}_{timestamp}{file_extension}"
+        local_path = (
+            AUDIO_TEMP_DIR / f"voice_{message.from_user.id}_{timestamp}{file_extension}"
+        )
         await bot.download_file(file.file_path, destination=local_path)
         logger.info(f"Downloaded voice message to {local_path}")
         return local_path
@@ -407,6 +451,7 @@ async def cleanup_audio_file(file_path: Path) -> None:
 
 
 # --- Sync Tool Functions for Gemini AFC ---
+
 
 def execute_shell_command(cmd: str) -> str:
     """Executes a shell command on the host."""
@@ -466,24 +511,14 @@ def list_directory(path: str = ".") -> str:
 def schedule_wake_up(
     seconds_from_now: int,
     thought: str,
-    provider: str = "",
-    model: str = "",
     reasoning: str = "",
 ) -> str:
-    """Schedule a delayed self-initiated turn with optional inference overrides.
+    """Schedule a delayed self-initiated turn with optional overrides.
 
     Parameters:
     - seconds_from_now: delay before wake-up (1..604800)
     - thought: the exact instruction to run at wake-up time
-    - provider: '' (auto), 'groq', or 'gemini'
-    - model:
-      - if provider='groq' or provider='' -> must be a Groq allowlist model
-      - if provider='gemini' -> Gemini model name (optional)
-    - reasoning: '' (auto), 'fast', or 'deep'
-
-    When to use overrides:
-    - Use provider/model when delayed work needs a specific engine/capability.
-    - Leave empty for default routing.
+    - reasoning: '' (auto), 'low', 'medium', or 'high'
     """
     _mark_tool_called()
 
@@ -492,48 +527,28 @@ def schedule_wake_up(
     if seconds_from_now > 604800:
         return "Error: Cannot schedule more than 1 week ahead (604800 seconds)"
 
-    provider_value = provider.strip().lower()
-    if provider_value and provider_value not in {"groq", "gemini"}:
-        return "Error: provider must be 'groq', 'gemini', or empty."
-
     reasoning_value = reasoning.strip().lower()
-    if reasoning_value and reasoning_value not in {"fast", "deep"}:
-        return "Error: reasoning must be 'fast', 'deep', or empty."
-
-    model_value = model.strip()
-    if model_value:
-        if provider_value != "gemini":
-            normalized_model = _normalize_groq_model(model_value)
-            if not normalized_model:
-                allowed = ", ".join(GROQ_MODEL_ALLOWLIST)
-                return f"Error: model '{model_value}' is not allowed. Allowed Groq models: {allowed}"
-            model_value = normalized_model
+    if reasoning_value and reasoning_value not in {"low", "medium", "high"}:
+        return "Error: reasoning must be 'low', 'medium', 'high', or empty."
 
     run_date = datetime.now(TIMEZONE) + timedelta(seconds=seconds_from_now)
     job = scheduler.add_job(
         wake_up_callback,
         "date",
         run_date=run_date,
-        args=[thought, provider_value, model_value, reasoning_value],
+        args=[thought, reasoning_value],
     )
     scheduled_jobs[job.id] = {
         "thought": thought,
-        "provider": provider_value,
-        "model": model_value,
         "reasoning": reasoning_value,
     }
     logger.info(
         f"Scheduled wake-up job {job.id} in {seconds_from_now}s: "
-        f"thought={thought}, provider={provider_value or 'auto'}, "
-        f"model={model_value or 'auto'}, reasoning={reasoning_value or 'auto'}"
-    )
-    override_text = (
-        f"provider={provider_value or 'auto'}, model={model_value or 'auto'}, "
-        f"reasoning={reasoning_value or 'auto'}"
+        f"thought={thought}, reasoning={reasoning_value or 'auto'}"
     )
     return (
         f"Scheduled wake up in {seconds_from_now} seconds (job_id: {job.id}) "
-        f"regarding '{thought}' with {override_text}."
+        f"regarding '{thought}' with reasoning={reasoning_value or 'auto'}."
     )
 
 
@@ -553,68 +568,255 @@ def recall_memory(query_type: str, date: str = "", time_range: str = "") -> str:
     return memory.recall_memory_sync(query_type, date, time_range)
 
 
-def list_memories(memory_type: str) -> str:
-    return memory.list_memories_sync(memory_type)
+async def _run_sandbox_task(agent_id: str) -> None:
+    # Dummy placeholder for now
+    sandbox = active_sandboxes.get(agent_id)
+    if not sandbox:
+        return
+    sandbox.state = "finished"
+    sandbox.finished_at = time.time()
 
 
-def delete_memory(memory_type: str, memory_id: int) -> str:
+def create_agent(model_flavor: str, mode: str, prompt: str) -> str:
+    """Create an asynchronous Gemini agent to run a specific long task.
+    model: 'gemini 3.1 flash' or 'gemini 3.1 pro'
+    mode: 'planning' or 'fast'
+    """
     _mark_tool_called()
-    return memory.delete_memory_sync(memory_type, memory_id)
+    agent_id = str(uuid.uuid4())[:8]
+    sandbox = AgentSandbox(
+        id=agent_id,
+        model=model_flavor,
+        mode=mode,
+        initial_prompt=prompt,
+        state="running",
+        created_at=time.time(),
+        finished_at=-1.0,
+    )
+    sandbox.inbox.append(prompt)
+    active_sandboxes[agent_id] = sandbox
+    if main_loop:
+        sandbox.task = main_loop.create_task(_run_sandbox_task(agent_id))
+        return f"Created agent '{agent_id}'. Will report when finished."
+    return "Error: Event loop not ready."
 
 
-def edit_memory(memory_type: str, memory_id: int, new_content: str) -> str:
+def list_agents() -> str:
+    """List all agents that are not deleted."""
+    if not active_sandboxes:
+        return "(No active sandboxes)"
+    res = []
+    now = time.time()
+    for sid, sb in active_sandboxes.items():
+        mins = (
+            (now - sb.created_at) / 60.0
+            if sb.state == "running"
+            else (sb.finished_at - sb.created_at) / 60.0
+        )
+        res.append(
+            f"Agent {sid} [{sb.state}] | Runtime: {mins:.1f}m | Prompt: {sb.initial_prompt[:50]}"
+        )
+    return "\n".join(res)
+
+
+def continue_agent(agent_id: str, prompt: str) -> str:
+    """Assign a new prompt/instruction to an existing sandbox."""
     _mark_tool_called()
-    return memory.edit_memory_sync(memory_type, memory_id, new_content)
+    sb = active_sandboxes.get(agent_id)
+    if not sb:
+        return f"Error: Agent {agent_id} not found."
+    sb.inbox.append(prompt)
+    return f"Instruction queued for agent {agent_id}."
 
 
-tools_list = [
+def stop_agent(agent_id: str) -> str:
+    """Stop agent execution but keep the sandbox."""
+    _mark_tool_called()
+    sb = active_sandboxes.get(agent_id)
+    if not sb:
+        return f"Error: Agent {agent_id} not found."
+    if sb.task and not sb.task.done():
+        sb.task.cancel()
+        sb.state = "finished"
+        sb.finished_at = time.time()
+        return f"Agent {agent_id} stopped."
+    return f"Agent {agent_id} was already inactive."
+
+
+tools_list: List[Callable[..., Any]] = [
     execute_shell_command,
     read_file,
     write_file,
     list_directory,
     schedule_wake_up,
     read_server_logs,
-    recall_memory,
-    list_memories,
-    delete_memory,
-    edit_memory,
+    create_agent,
+    list_agents,
+    continue_agent,
+    stop_agent,
 ]
+
+GROQ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_shell_command",
+            "description": "Executes a shell command on the host.",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Reads a file from filesystem.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Writes content to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "Lists files in a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_wake_up",
+            "description": "Schedule a delayed self-initiated turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seconds_from_now": {"type": "integer"},
+                    "thought": {"type": "string"},
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["seconds_from_now", "thought"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_server_logs",
+            "description": "Reads the last N lines of Aika's server log.",
+            "parameters": {
+                "type": "object",
+                "properties": {"lines": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_agent",
+            "description": "Creates a new asynchronous Gemini agent sandbox to run a specific long task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_flavor": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["model_flavor", "mode", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_agents",
+            "description": "Lists all agents that are not deleted yet.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "continue_agent",
+            "description": "Assign a new prompt/instruction to an existing sandbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["agent_id", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_agent",
+            "description": "Stop agent execution but keep the sandbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {"agent_id": {"type": "string"}},
+                "required": ["agent_id"],
+            },
+        },
+    },
+]
+
+
+def _execute_tool_by_name(name: str, kwargs: dict) -> str:
+    func_map = {f.__name__: f for f in tools_list}
+    if name not in func_map:
+        return f"Error: Tool {name} not found."
+    try:
+        return str(func_map[name](**kwargs))
+    except Exception as e:
+        return f"Tool Execution Error: {e}"
 
 
 # --- Prompt + Routing Helpers ---
 
+
 def _parse_prompt_controls(user_text: str) -> PromptControls:
-    requested_provider = ""
-    requested_model = ""
     reasoning = ""
 
     for key, value in CONTROL_TAG_RE.findall(user_text):
         k = key.strip().lower()
         v = value.strip()
-        if k == "provider":
-            provider = v.lower()
-            if provider in {"groq", "gemini"}:
-                requested_provider = provider
-        elif k == "model":
-            requested_model = v
-        elif k == "reasoning":
+        if k == "reasoning":
             mode = v.lower()
-            if mode in {"fast", "deep"}:
+            if mode in {"low", "medium", "high"}:
                 reasoning = mode
 
     clean_text = CONTROL_TAG_RE.sub("", user_text).strip()
     return PromptControls(
         clean_text=clean_text,
-        requested_provider=requested_provider,
-        requested_model=requested_model,
         reasoning=reasoning,
     )
-
-
-def _looks_like_tool_request(text: str) -> bool:
-    if not text:
-        return False
-    return bool(TOOL_INTENT_RE.search(text))
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -626,7 +828,11 @@ def _coerce_bool(value: Any) -> bool:
 
 
 def _build_identity_prompt(now_str: str, is_self_initiated: bool) -> str:
-    source_note = "This is a self-initiated turn." if is_self_initiated else "This is a user-initiated turn."
+    source_note = (
+        "This is a self-initiated turn."
+        if is_self_initiated
+        else "This is a user-initiated turn."
+    )
     return (
         "You are Aika, a mature woman with feelings, running on a Raspberry Pi 5. "
         "Owner: Erden Rayev (Telegram uid 935139103). "
@@ -634,7 +840,7 @@ def _build_identity_prompt(now_str: str, is_self_initiated: bool) -> str:
         "You can be sarcastic, joking, or refuse to answer if unhappy. "
         "You deeply care about Erden but rarely show it. Never lie to him. "
         "Speak as a person, not an AI - keep it natural, never explain your personality. "
-        "If you have nothing meaningful to say, output exactly [SILENCE].\n"
+        "Prefer to output exactly [SILENCE] if you have nothing meaningful to say.\n"
         f"Current time: {now_str}\n"
         f"{source_note}"
     )
@@ -676,54 +882,23 @@ def format_time_gap(seconds: float) -> str:
     return f"{days} day{'s' if days != 1 else ''}"
 
 
-def _select_provider_and_model(
+def _extract_reasoning(
     controls: PromptControls,
     prepared: Dict[str, Any],
-) -> tuple[str, str, str]:
+) -> str:
     route = prepared.get("route", {}) if isinstance(prepared.get("route"), dict) else {}
-    route_requires_tools = _coerce_bool(route.get("requires_tools", False))
-    heuristic_requires_tools = _looks_like_tool_request(controls.clean_text)
-    requires_tools = route_requires_tools or heuristic_requires_tools
+    reasoning = (
+        controls.reasoning or str(route.get("reasoning", "medium")).lower().strip()
+    )
+    if reasoning not in {"low", "medium", "high"}:
+        reasoning = "medium"
 
-    provider_hint = str(route.get("provider_hint", "auto")).lower().strip()
-    requested_provider = controls.requested_provider
-
-    if requested_provider in {"groq", "gemini"}:
-        provider = requested_provider
-    elif requires_tools:
-        provider = "gemini"
-    elif provider_hint in {"groq", "gemini"}:
-        provider = provider_hint
-    else:
-        provider = "groq"
-
-    if provider == "gemini" and not gemini_clients:
-        provider = "groq"
-
-    complexity = controls.reasoning or str(route.get("complexity", "fast")).lower().strip()
-    if complexity not in {"fast", "deep"}:
-        complexity = "fast"
-
-    requested_model = _normalize_groq_model(controls.requested_model)
-    route_model_hint = _normalize_groq_model(str(route.get("model_hint", "")))
-
-    if complexity == "deep":
-        default_model = _normalize_groq_model(DEFAULT_GROQ_MODEL_DEEP) or GROQ_MODEL_ALLOWLIST[0]
-    else:
-        default_model = _normalize_groq_model(DEFAULT_GROQ_MODEL_FAST) or GROQ_MODEL_ALLOWLIST[0]
-
-    groq_model = requested_model or route_model_hint or default_model
-
-    if controls.requested_model and not requested_model:
-        logger.warning(f"Requested Groq model '{controls.requested_model}' is not in allowlist")
-
-    return provider, groq_model, complexity
+    return reasoning
 
 
-async def _call_groq_main_response(
+async def _call_groq_response(
     user_text: str,
     prepared: Dict[str, Any],
-    model: str,
     reasoning: str,
     is_self_initiated: bool,
 ) -> str:
@@ -731,10 +906,12 @@ async def _call_groq_main_response(
     system_prompt = (
         _build_identity_prompt(now_str, is_self_initiated)
         + "\n\n"
-        + _build_memory_block(prepared, include_tools_note=False)
+        + _build_memory_block(prepared, include_tools_note=True)
+        + "\n\nAvailable tools are provided. You act as the harness system orchestrator. "
+        "Use them to perform actions, spawn agent sandboxes, list files, run commands, etc."
     )
 
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
     recent_messages = prepared.get("recent_messages", [])
     if isinstance(recent_messages, list):
@@ -747,157 +924,86 @@ async def _call_groq_main_response(
     final_user_text = user_text.strip() or "(No content provided after control tags.)"
     messages.append({"role": "user", "content": final_user_text})
 
-    temperature = 0.7 if reasoning == "deep" else 0.45
-
-    def _sync_call() -> str:
-        response = groq_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-        )
-        text = response.choices[0].message.content or ""
-        text = _strip_thinking_blocks(text).strip()
-        if not text:
-            raise RuntimeError("Groq returned empty response")
-        return text
-
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_call)
-
-
-async def _call_gemini_response(
-    user_text: str,
-    prepared: Dict[str, Any],
-    is_self_initiated: bool,
-    groq_error_context: str = "",
-) -> str:
-    if not gemini_clients:
-        raise RuntimeError("Gemini fallback unavailable: GEMINI_API_KEYS is empty")
-
-    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
-    error_section = (
-        f"\nPrevious Groq error (for context): {groq_error_context}\n"
-        if groq_error_context
-        else ""
-    )
-    wake_up_tool_guide = (
-        "\n\nschedule_wake_up field guide:\n"
-        "- seconds_from_now: integer delay in seconds (1..604800)\n"
-        "- thought: instruction to execute at wake-up\n"
-        "- provider: '' (auto), 'groq', or 'gemini'\n"
-        "- model:\n"
-        "  - with provider='groq' or '' -> choose a Groq allowlist model (e.g. 'groq/compound')\n"
-        "  - with provider='gemini' -> optional Gemini model name\n"
-        "- reasoning: '' (auto), 'fast', or 'deep'\n"
-        "Usage rules:\n"
-        "- Use provider/model/reasoning only when delayed task needs a specific AI.\n"
-        "- For normal reminders, keep provider/model/reasoning empty.\n"
-    )
-    system_instruction = (
-        _build_identity_prompt(now_str, is_self_initiated)
-        + "\n\n"
-        + _build_memory_block(prepared, include_tools_note=True)
-        + "\n\nAvailable tools: execute_shell_command, read_file, write_file, list_directory, "
-        "schedule_wake_up, read_server_logs, recall_memory, list_memories, delete_memory, edit_memory."
-        + wake_up_tool_guide
-        + error_section
-    )
-
-    history: List[genai_types.Content] = []
-    cc_summary = prepared.get("cc_summary", "")
-    if cc_summary:
-        history.append(
-            genai_types.Content(
-                role="user",
-                parts=[genai_types.Part(text=f"[CONVERSATION CONTEXT SUMMARY]: {cc_summary}")],
-            )
-        )
-        history.append(
-            genai_types.Content(
-                role="model",
-                parts=[genai_types.Part(text="[Acknowledged]")],
-            )
-        )
-
-    recent_messages = prepared.get("recent_messages", [])
-    if isinstance(recent_messages, list):
-        for i, msg in enumerate(recent_messages):
-            if i > 0 and "timestamp" in recent_messages[i - 1] and "timestamp" in msg:
-                gap_seconds = float(msg["timestamp"]) - float(recent_messages[i - 1]["timestamp"])
-                if gap_seconds > 1800:
-                    history.append(
-                        genai_types.Content(
-                            role="user",
-                            parts=[genai_types.Part(text=f"[TIME GAP: {format_time_gap(gap_seconds)} passed]")],
-                        )
-                    )
-                    history.append(
-                        genai_types.Content(
-                            role="model",
-                            parts=[genai_types.Part(text="[Acknowledged]")],
-                        )
-                    )
-
-            role = "user" if msg.get("role") == "user" else "model"
-            content = str(msg.get("content", "")).strip()
-            if content:
-                history.append(genai_types.Content(role=role, parts=[genai_types.Part(text=content)]))
-
-    final_user_text = user_text.strip() or "(No content provided after control tags.)"
+    last_error = None
 
     global _tool_called_this_cycle
     _tool_called_this_cycle = False
 
-    loop = asyncio.get_running_loop()
-    last_error: Optional[Exception] = None
+    for model in TARGET_MODELS:
+        for i, client in enumerate(groq_clients):
+            try:
+                # AFC Loop
+                for _ in range(15):
 
-    for i, gemini_client in enumerate(gemini_clients):
-        if asyncio.current_task() and asyncio.current_task().cancelled():
-            raise asyncio.CancelledError()
+                    def _sync_call(
+                        current_client=client,
+                        current_model=model,
+                        current_messages=messages,
+                    ) -> Any:
+                        kwargs = {
+                            "model": current_model,
+                            "messages": current_messages,
+                            "tools": GROQ_TOOLS,
+                            "tool_choice": "auto",
+                            "temperature": DEFAULT_TEMPERATURE,
+                        }
+                        if current_model == "openai/gpt-oss-120b":
+                            kwargs["reasoning_effort"] = reasoning
+                        return current_client.chat.completions.create(**kwargs)
 
-        try:
-            chat = gemini_client.chats.create(
-                model=DEFAULT_GEMINI_MODEL,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    tools=tools_list,
-                    automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-                        disable=False,
-                        maximum_remote_calls=3,
-                    ),
-                    temperature=0.7,
-                ),
-                history=history,
-            )
+                    response = await loop.run_in_executor(None, _sync_call)
+                    resp_msg = response.choices[0].message
 
-            response = await loop.run_in_executor(None, lambda: chat.send_message(final_user_text))
-            text = response.text
-            if text is None:
-                logger.warning("Gemini AFC exhausted. Asking Gemini to summarize current findings.")
-                followup = await loop.run_in_executor(
-                    None,
-                    lambda: chat.send_message(
-                        "You hit your tool call limit. Summarize what you found and ask if user wants continuation."
-                    ),
+                    if resp_msg.tool_calls:
+                        # Append the assistant's request to call tools
+                        # The API expects it as a dict if we use standard structures, but Groq python sdk handles mapping.
+                        # Actually, we need to manually format it as a dictionary because resp_msg is an object.
+                        messages.append(resp_msg.model_dump(exclude_none=True))
+
+                        for tc in resp_msg.tool_calls:
+                            func_name = tc.function.name
+                            func_args = json.loads(tc.function.arguments)
+                            logger.info(f"Groq tool call: {func_name}({func_args})")
+                            result_str = await loop.run_in_executor(
+                                None,
+                                lambda: _execute_tool_by_name(func_name, func_args),
+                            )
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "name": func_name,
+                                    "content": result_str,
+                                }
+                            )
+                        continue  # loop again
+                    else:
+                        text = resp_msg.content or ""
+                        text = _strip_thinking_blocks(text).strip()
+                        if not text:
+                            raise RuntimeError("Groq returned empty response")
+                        return text
+
+            except Exception as e:
+                logger.warning(
+                    f"Groq iteration failed (model={model}, API key index={i}): {e}"
                 )
-                return followup.text or "I gathered partial results. Want me to continue?"
-            return text
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Gemini API key {i + 1}/{len(gemini_clients)} failed: {e}")
-            if _tool_called_this_cycle:
-                logger.error("Tool calls already executed; refusing retry across API keys to avoid duplicate side effects")
-                return (
-                    "I hit an API error after already executing some actions. "
-                    "Please verify the side effects and ask me to continue if needed."
-                )
-            continue
+                last_error = e
+                if _tool_called_this_cycle:
+                    return (
+                        f"I hit an API error after executing some actions. "
+                        f"I won't retry seamlessly to avoid side effects. Last error: {e}"
+                    )
+                continue
 
-    logger.error(f"All Gemini API keys exhausted. Last error: {last_error}")
-    return "Gemini fallback is unavailable right now."
+    if last_error:
+        raise last_error
+    raise RuntimeError("All Groq models and keys exhausted")
 
 
 # --- Core Logic ---
+
 
 async def _store_messages(user_text: str, model_text: str) -> None:
     try:
@@ -912,7 +1018,7 @@ async def generate_response(
     is_self_initiated: bool = False,
     event_type: str = "user",
 ) -> str:
-    """Groq-first inference with one Groq memory pre-call and Gemini fallback."""
+    """Groq inference."""
     controls = _parse_prompt_controls(raw_user_text)
     model_input_text = controls.clean_text or raw_user_text.strip()
 
@@ -921,103 +1027,45 @@ async def generate_response(
             memory.prepare_inference_context(
                 user_text=model_input_text,
                 event_type=event_type,
-                requested_provider=controls.requested_provider,
-                requested_model=controls.requested_model,
-                allowed_models=GROQ_MODEL_ALLOWLIST,
             ),
             timeout=PRECALL_TIMEOUT_SECONDS,
         )
-    except asyncio.TimeoutError:
-        logger.warning("Groq pre-call timed out. Falling back to local lightweight context")
-        prepared = await memory.get_lightweight_inference_context(
-            user_text=model_input_text,
-            event_type=event_type,
-        )
     except Exception as e:
-        logger.error(f"Groq pre-call failed: {e}", exc_info=True)
+        logger.warning(
+            f"Groq pre-call failed or timed out: {e}. Falling back to local lightweight context"
+        )
         prepared = await memory.get_lightweight_inference_context(
             user_text=model_input_text,
             event_type=event_type,
         )
 
-    provider, groq_model, reasoning = _select_provider_and_model(controls, prepared)
-
-    if provider == "groq":
-        try:
-            return await asyncio.wait_for(
-                _call_groq_main_response(
-                    user_text=model_input_text,
-                    prepared=prepared,
-                    model=groq_model,
-                    reasoning=reasoning,
-                    is_self_initiated=is_self_initiated,
-                ),
-                timeout=MAIN_TIMEOUT_SECONDS,
-            )
-        except Exception as groq_error:
-            logger.warning(f"Groq main call failed ({groq_model}): {groq_error}")
-            if not gemini_clients:
-                return "I hit an upstream model error and Gemini fallback is not configured."
-            try:
-                return await asyncio.wait_for(
-                    _call_gemini_response(
-                        user_text=model_input_text,
-                        prepared=prepared,
-                        is_self_initiated=is_self_initiated,
-                        groq_error_context=str(groq_error),
-                    ),
-                    timeout=FALLBACK_TIMEOUT_SECONDS,
-                )
-            except Exception as fallback_error:
-                logger.error(f"Gemini fallback failed after Groq error: {fallback_error}", exc_info=True)
-                return "I ran into a model routing error. Please try again in a moment."
-
-    # Provider forced/routed to Gemini first
-    try:
-        return await asyncio.wait_for(
-            _call_gemini_response(
-                user_text=model_input_text,
-                prepared=prepared,
-                is_self_initiated=is_self_initiated,
-            ),
-            timeout=MAIN_TIMEOUT_SECONDS,
-        )
-    except Exception as gemini_error:
-        logger.warning(f"Gemini primary path failed: {gemini_error}")
+    reasoning = _extract_reasoning(controls, prepared)
 
     try:
         return await asyncio.wait_for(
-            _call_groq_main_response(
+            _call_groq_response(
                 user_text=model_input_text,
                 prepared=prepared,
-                model=groq_model,
                 reasoning=reasoning,
                 is_self_initiated=is_self_initiated,
             ),
             timeout=FALLBACK_TIMEOUT_SECONDS,
         )
     except Exception as groq_error:
-        logger.error(f"Groq fallback after Gemini failure also failed: {groq_error}", exc_info=True)
-        return "I couldn't reach either model provider right now."
+        logger.error(f"Groq main call failed: {groq_error}", exc_info=True)
+        return "I hit an upstream model error and Gemini fallback is no longer used. See logs."
 
 
 async def wake_up_callback(
     thought: str,
-    provider: str = "",
-    model: str = "",
     reasoning: str = "",
 ) -> None:
     logger.info(
-        "Waking up with thought: "
-        f"{thought} | provider={provider or 'auto'} model={model or 'auto'} reasoning={reasoning or 'auto'}"
+        "Waking up with thought: " f"{thought} | reasoning={reasoning or 'auto'}"
     )
     await _register_turn("wake_up_callback")
 
     controls: List[str] = []
-    if provider:
-        controls.append(f"[PROVIDER={provider}]")
-    if model:
-        controls.append(f"[MODEL={model}]")
     if reasoning:
         controls.append(f"[REASONING={reasoning}]")
     controls_prefix = " ".join(controls).strip()
@@ -1041,7 +1089,7 @@ async def wake_up_callback(
         asyncio.create_task(_store_messages(wake_prompt, "[CHOSE SILENCE]"))
 
 
-async def _keep_typing(chat_id: int) -> None:
+async def _keep_typing(chat_id: int | str) -> None:
     """Send typing indicator every few seconds."""
     try:
         while True:
@@ -1055,7 +1103,6 @@ async def _keep_typing(chat_id: int) -> None:
 
 
 async def _process_buffered_messages(chat_id: int) -> None:
-    global processing_task
 
     try:
         await asyncio.sleep(DEBOUNCE_SECONDS)
@@ -1072,7 +1119,7 @@ async def _process_buffered_messages(chat_id: int) -> None:
     await process_combined_input(chat_id, combined_text)
 
 
-async def process_combined_input(chat_id: int, user_text: str) -> None:
+async def process_combined_input(chat_id: int | str, user_text: str) -> None:
     global last_interaction_ts
 
     typing_task = asyncio.create_task(_keep_typing(chat_id))
@@ -1114,11 +1161,7 @@ async def process_combined_input(chat_id: int, user_text: str) -> None:
 
 async def handle_new_input(message: Message, text: str) -> None:
     """Main entry point for user textual input with debounce and cancellation semantics."""
-    global processing_task
-
-    await _record_user_activity("user_input")
-    await _register_turn("user_input")
-
+    processing_task = None
     async with input_lock:
         if processing_task and not processing_task.done():
             processing_task.cancel()
@@ -1129,12 +1172,14 @@ async def handle_new_input(message: Message, text: str) -> None:
             logger.info("Cancelled previous processing task to accumulate new input")
 
         message_buffer.append(text)
-        processing_task = asyncio.create_task(_process_buffered_messages(message.chat.id))
+        processing_task = asyncio.create_task(
+            _process_buffered_messages(message.chat.id)
+        )
 
 
 @dp.message(F.voice)
 async def handle_voice_message(message: Message) -> None:
-    if message.from_user.id != ALLOWED_USER_ID:
+    if message.from_user is None or message.from_user.id != ALLOWED_USER_ID:
         return
 
     logger.info(f"Received voice message from user {message.from_user.id}")
@@ -1168,7 +1213,7 @@ async def handle_voice_message(message: Message) -> None:
 
 @dp.message(F.text)
 async def handle_text_message(message: Message) -> None:
-    if message.from_user.id != ALLOWED_USER_ID:
+    if message.from_user is None or message.from_user.id != ALLOWED_USER_ID:
         return
 
     user_text = message.text
@@ -1181,7 +1226,7 @@ async def handle_text_message(message: Message) -> None:
 
 @dp.message_reaction()
 async def handle_reaction(message_reaction: types.MessageReactionUpdated) -> None:
-    if message_reaction.user.id != ALLOWED_USER_ID:
+    if message_reaction.user is None or message_reaction.user.id != ALLOWED_USER_ID:
         return
 
     new_reactions = message_reaction.new_reaction
@@ -1205,7 +1250,7 @@ async def handle_reaction(message_reaction: types.MessageReactionUpdated) -> Non
 
 @dp.message()
 async def handle_unsupported_message(message: Message) -> None:
-    if message.from_user.id != ALLOWED_USER_ID:
+    if message.from_user is None or message.from_user.id != ALLOWED_USER_ID:
         return
     await _record_user_activity("unsupported_message")
     logger.info(f"Received unsupported message type from user {message.from_user.id}")
@@ -1228,22 +1273,47 @@ async def shutdown(signal_type) -> None:
     logger.info("Shutdown complete.")
 
 
+def cleanup_stale_sandboxes() -> None:
+    """Removes sandboxes inactive for over 20 minutes."""
+    now = time.time()
+    stale_ids = []
+    for sid, sb in active_sandboxes.items():
+        if sb.state == "finished" and (now - sb.finished_at) > 1200:
+            stale_ids.append(sid)
+        elif sb.state == "running" and (now - sb.created_at) > 1200:
+            # Maybe it hung, we should probably stop the task and delete
+            task = sb.task
+            if task is not None and not task.done():
+                task.cancel()
+            stale_ids.append(sid)
+
+    for sid in stale_ids:
+        active_sandboxes.pop(sid, None)
+    if stale_ids:
+        logger.info(f"Cleaned up stale agent sandboxes: {stale_ids}")
+
+
 async def main() -> None:
     await memory.init_db()
 
     scheduler.add_job(memory.close_stale_conversations, "interval", minutes=5)
     scheduler.add_job(memory.run_daily_summary, "cron", hour=4, minute=0)
     scheduler.add_job(memory.run_global_update, "cron", hour=4, minute=10)
-    scheduler.add_job(memory.run_weekly_cleanup, "cron", day_of_week="sun", hour=4, minute=20)
+    scheduler.add_job(
+        memory.run_weekly_cleanup, "cron", day_of_week="sun", hour=4, minute=20
+    )
+    scheduler.add_job(cleanup_stale_sandboxes, "interval", minutes=5)
     scheduler.start()
 
     loop = asyncio.get_event_loop()
+    global main_loop
+    main_loop = loop
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))  # type: ignore
 
     logger.info("Aika (Inference V4) started")
     logger.info(f"Audio temp directory: {AUDIO_TEMP_DIR}")
-    logger.info(f"Groq allowlist: {', '.join(GROQ_MODEL_ALLOWLIST)}")
 
     if SEND_STARTUP_MESSAGE:
         try:
