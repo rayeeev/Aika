@@ -41,7 +41,7 @@ GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEYS_RAW.split(",") if key.stri
 
 # Routing + latency configuration
 PRECALL_TIMEOUT_SECONDS = 4.0
-MAIN_TIMEOUT_SECONDS = 9.0
+
 FALLBACK_TIMEOUT_SECONDS = 9.0
 GENERATION_CAP_SECONDS = 24.0
 DEBOUNCE_SECONDS = 0.8
@@ -62,9 +62,6 @@ TARGET_MODELS = [
 # --- Logging Setup ---
 LOG_FILE = Path(os.path.dirname(os.path.dirname(__file__))) / "aika.log"
 
-# Clear log on startup
-if LOG_FILE.exists():
-    LOG_FILE.write_text("")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,9 +116,6 @@ scheduled_jobs: Dict[str, Dict[str, str]] = {}
 # Store loop state for sync wrappers
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 
-
-# Track whether any side-effecting tool was called during current Gemini AFC cycle.
-_tool_called_this_cycle = False
 
 # --- Message Buffering & Turn State ---
 message_buffer: deque[str] = deque()
@@ -178,9 +172,6 @@ def _strip_thinking_blocks(text: str) -> str:
     return text
 
 
-def _mark_tool_called() -> None:
-    global _tool_called_this_cycle
-    _tool_called_this_cycle = True
 
 
 async def _register_turn(event_name: str) -> None:
@@ -254,39 +245,51 @@ async def _proactive_chain_is_still_valid(
         )
 
 
-async def _decide_proactive_thought(stage: int) -> Optional[str]:
-    """Return proactive thought text or None if no proactive message should be sent."""
-    if not hasattr(Memory, "_call_groq"):
-        return None
+async def _should_proactive_continue(stage: int) -> bool:
+    """Decide whether Aika should proactively continue the conversation.
+
+    This is a strict gate — it returns True only when silence would be clearly wrong:
+    - Aika asked the user a direct question and got no text reply (only a reaction)
+    - Aika explicitly promised to follow up or check something
+    - A critical piece of information was requested but never provided
+
+    In ALL other cases it returns False. The default is silence.
+    """
+    if not memory.groq_client:
+        return False
     cc = await memory.get_conversation_context(limit_messages=8)
     recent_msgs = cc["messages"][-8:]
     if not recent_msgs:
-        return None
+        return False
+
+    # Quick heuristic: if the last message is from the user, no need to follow up
+    if recent_msgs[-1]["role"] == "user":
+        return False
 
     history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in recent_msgs)
     prompt = (
-        f"Recent conversation:\n\n{history_text}\n\n"
-        f"Proactive stage: {stage} of {PROACTIVE_MAX_OUTPUTS}.\n"
-        "Should Aika follow up? Only if genuinely necessary — e.g. an unanswered question, "
-        "a promise to check back, or critical missing info. When in doubt, don't.\n"
-        "- If no follow-up is needed, output exactly [NO]\n"
-        "- If needed, output one short guiding thought only\n"
+        "You are a silent gate that decides if a follow-up is REQUIRED.\n"
+        "You are NOT generating a response — only deciding YES or NO.\n\n"
+        f"Recent conversation:\n{history_text}\n\n"
+        f"Stage: {stage}/{PROACTIVE_MAX_OUTPUTS}.\n\n"
+        "Answer YES only if ALL of these are true:\n"
+        "1. Aika's last message contains an unanswered direct question to the user, "
+        "OR Aika explicitly promised to follow up / check back on something\n"
+        "2. The user has NOT already responded with text (reactions alone don't count as a response)\n"
+        "3. Staying silent would clearly break the conversation flow\n\n"
+        "If in ANY doubt, answer NO. Silence is almost always the right choice.\n"
+        "Output EXACTLY one word: YES or NO"
     )
 
-    loop = asyncio.get_running_loop()
-    completion = await loop.run_in_executor(
-        None,
-        lambda: groq_clients[0].chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
-            temperature=0.35,
-        ),
+    result = await memory._call_groq(
+        prompt,
+        system="You are a binary decision gate. Output exactly YES or NO. Nothing else.",
+        model=memory.filter_model,
+        temperature=0.1,
     )
-    result = (completion.choices[0].message.content or "").strip()
-    result = _strip_thinking_blocks(result)
-    if not result or "[NO]" in result:
-        return None
-    return result
+    if not result:
+        return False
+    return result.strip().upper() == "YES"
 
 
 async def _run_proactive_chain(
@@ -312,15 +315,19 @@ async def _run_proactive_chain(
                 )
                 return
 
-            thought = await _decide_proactive_thought(stage)
-            if not thought:
+            should_continue = await _should_proactive_continue(stage)
+            if not should_continue:
                 logger.info(
-                    f"Proactive chain {chain_id} stage {stage}: no proactive action"
+                    f"Proactive chain {chain_id} stage {stage}: gate said NO"
                 )
                 return
 
+            # Tell the main model to *continue* the conversation naturally,
+            # not respond to a separate prompt.
             response_text = await generate_response(
-                f"[PROVIDER=groq] [PROACTIVE THOUGHT]: {thought}",
+                "[CONTINUE] The user hasn't replied yet. "
+                "Continue the conversation naturally if you have something to add, "
+                "or output [SILENCE] if there's nothing meaningful to say.",
                 is_self_initiated=True,
                 event_type="proactive",
             )
@@ -342,10 +349,9 @@ async def _run_proactive_chain(
             await bot.send_message(chat_id=ALLOWED_USER_ID, text=response_text)
             await _register_turn("assistant_reply_proactive")
             asyncio.create_task(
-                _store_messages(f"[PROACTIVE: {thought}]", response_text)
+                _store_messages("[PROACTIVE CONTINUATION]", response_text)
             )
 
-            # Only schedule another proactive check after the first proactive output.
             if stage >= PROACTIVE_MAX_OUTPUTS:
                 logger.info(f"Proactive chain {chain_id} reached max proactive outputs")
                 return
@@ -455,7 +461,6 @@ async def cleanup_audio_file(file_path: Path) -> None:
 
 def execute_shell_command(cmd: str) -> str:
     """Executes a shell command on the host."""
-    _mark_tool_called()
     import subprocess
 
     try:
@@ -487,7 +492,6 @@ def read_file(path: str) -> str:
 
 def write_file(path: str, content: str) -> str:
     """Writes content to a file."""
-    _mark_tool_called()
     try:
         abs_path = os.path.abspath(path)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -520,7 +524,6 @@ def schedule_wake_up(
     - thought: the exact instruction to run at wake-up time
     - reasoning: '' (auto), 'low', 'medium', or 'high'
     """
-    _mark_tool_called()
 
     if seconds_from_now <= 0:
         return f"Error: seconds_from_now must be positive, got {seconds_from_now}"
@@ -564,17 +567,74 @@ def read_server_logs(lines: int = 50) -> str:
         return f"Failed to read logs: {e}"
 
 
-def recall_memory(query_type: str, date: str = "", time_range: str = "") -> str:
-    return memory.recall_memory_sync(query_type, date, time_range)
+
 
 
 async def _run_sandbox_task(agent_id: str) -> None:
-    # Dummy placeholder for now
+    """Run a Gemini agent sandbox task asynchronously."""
     sandbox = active_sandboxes.get(agent_id)
     if not sandbox:
         return
-    sandbox.state = "finished"
-    sandbox.finished_at = time.time()
+
+    if not gemini_clients:
+        logger.error(f"Agent {agent_id}: No Gemini API keys configured")
+        sandbox.state = "finished"
+        sandbox.finished_at = time.time()
+        sandbox.history.append(
+            genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text="Error: No Gemini API keys configured.")],
+            )
+        )
+        return
+
+    model_name = (
+        "gemini-3-flash-preview" if "flash" in sandbox.model.lower()
+        else "gemini-3.1-pro-preview"
+    )
+    client = gemini_clients[0]
+
+    try:
+        while sandbox.inbox:
+            prompt_text = sandbox.inbox.pop(0)
+            sandbox.history.append(
+                genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part(text=prompt_text)],
+                )
+            )
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.models.generate_content(
+                    model=model_name,
+                    contents=sandbox.history,
+                ),
+            )
+
+            response_text = response.text or "(empty response)"
+            sandbox.history.append(
+                genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text=response_text)],
+                )
+            )
+            logger.info(f"Agent {agent_id} got response ({len(response_text)} chars)")
+
+    except asyncio.CancelledError:
+        logger.info(f"Agent {agent_id} was cancelled")
+    except Exception as e:
+        logger.error(f"Agent {agent_id} failed: {e}", exc_info=True)
+        sandbox.history.append(
+            genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=f"Error: {e}")],
+            )
+        )
+    finally:
+        sandbox.state = "finished"
+        sandbox.finished_at = time.time()
 
 
 def create_agent(model_flavor: str, mode: str, prompt: str) -> str:
@@ -582,7 +642,6 @@ def create_agent(model_flavor: str, mode: str, prompt: str) -> str:
     model: 'gemini 3.1 flash' or 'gemini 3.1 pro'
     mode: 'planning' or 'fast'
     """
-    _mark_tool_called()
     agent_id = str(uuid.uuid4())[:8]
     sandbox = AgentSandbox(
         id=agent_id,
@@ -621,17 +680,19 @@ def list_agents() -> str:
 
 def continue_agent(agent_id: str, prompt: str) -> str:
     """Assign a new prompt/instruction to an existing sandbox."""
-    _mark_tool_called()
     sb = active_sandboxes.get(agent_id)
     if not sb:
         return f"Error: Agent {agent_id} not found."
     sb.inbox.append(prompt)
+    # If the sandbox has finished, re-trigger it to process the new prompt
+    if sb.state == "finished" and main_loop:
+        sb.state = "running"
+        sb.task = main_loop.create_task(_run_sandbox_task(agent_id))
     return f"Instruction queued for agent {agent_id}."
 
 
 def stop_agent(agent_id: str) -> str:
     """Stop agent execution but keep the sandbox."""
-    _mark_tool_called()
     sb = active_sandboxes.get(agent_id)
     if not sb:
         return f"Error: Agent {agent_id} not found."
@@ -655,6 +716,7 @@ tools_list: List[Callable[..., Any]] = [
     continue_agent,
     stop_agent,
 ]
+
 
 GROQ_TOOLS = [
     {
@@ -819,12 +881,6 @@ def _parse_prompt_controls(user_text: str) -> PromptControls:
     )
 
 
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "y"}
-    return bool(value)
 
 
 def _build_identity_prompt(now_str: str, is_self_initiated: bool) -> str:
@@ -927,8 +983,7 @@ async def _call_groq_response(
     loop = asyncio.get_running_loop()
     last_error = None
 
-    global _tool_called_this_cycle
-    _tool_called_this_cycle = False
+    tool_called_this_request = False
 
     for model in TARGET_MODELS:
         for i, client in enumerate(groq_clients):
@@ -967,8 +1022,9 @@ async def _call_groq_response(
                             logger.info(f"Groq tool call: {func_name}({func_args})")
                             result_str = await loop.run_in_executor(
                                 None,
-                                lambda: _execute_tool_by_name(func_name, func_args),
+                                lambda fn=func_name, fa=func_args: _execute_tool_by_name(fn, fa),
                             )
+                            tool_called_this_request = True
                             messages.append(
                                 {
                                     "role": "tool",
@@ -990,7 +1046,7 @@ async def _call_groq_response(
                     f"Groq iteration failed (model={model}, API key index={i}): {e}"
                 )
                 last_error = e
-                if _tool_called_this_cycle:
+                if tool_called_this_request:
                     return (
                         f"I hit an API error after executing some actions. "
                         f"I won't retry seamlessly to avoid side effects. Last error: {e}"
@@ -1027,6 +1083,7 @@ async def generate_response(
             memory.prepare_inference_context(
                 user_text=model_input_text,
                 event_type=event_type,
+                requested_reasoning=controls.reasoning,
             ),
             timeout=PRECALL_TIMEOUT_SECONDS,
         )
@@ -1161,7 +1218,7 @@ async def process_combined_input(chat_id: int | str, user_text: str) -> None:
 
 async def handle_new_input(message: Message, text: str) -> None:
     """Main entry point for user textual input with debounce and cancellation semantics."""
-    processing_task = None
+    global processing_task
     async with input_lock:
         if processing_task and not processing_task.done():
             processing_task.cancel()

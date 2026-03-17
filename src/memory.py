@@ -4,7 +4,6 @@ import json
 import re
 import time
 import os
-import threading
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
@@ -20,7 +19,6 @@ TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 # --- Configuration ---
 CONVERSATION_GAP_SECONDS = 1800  # 30 minutes → new conversation
-IMMEDIATE_BUFFER_INTERACTIONS = 10  # 10 interactions = 20 messages max
 CC_SUMMARY_MAX_SENTENCES = 3
 CONVERSATION_SUMMARY_MAX_SENTENCES = 4
 DAY_SUMMARY_MAX_SENTENCES = 3
@@ -44,7 +42,6 @@ class Memory:
         self.filter_model = "qwen/qwen3-32b"
         self._lock = asyncio.Lock()
         self._compaction_lock = asyncio.Lock()
-        self._sync_lock = threading.Lock()  # For sync tool methods (Gemini AFC)
 
     def set_groq_client(self, client: Optional[Groq]):
         self.groq_client = client
@@ -194,68 +191,7 @@ class Memory:
                 )
                 await db.commit()
 
-    async def _maybe_update_cc(self, db, conv_id: int):
-        """If the conversation has more than IMMEDIATE_BUFFER_INTERACTIONS interactions,
-        fold the oldest interaction into the CC summary."""
-        # Count total messages in this conversation
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conv_id,)
-        )
-        total_messages = (await cursor.fetchone())[0]
-        buffer_messages = (
-            IMMEDIATE_BUFFER_INTERACTIONS * 2
-        )  # 10 interactions = 20 messages
 
-        if total_messages <= buffer_messages:
-            return  # Buffer not overflowing
-
-        # Get messages that are outside the buffer (oldest ones to fold in)
-        overflow_count = total_messages - buffer_messages
-        cursor = await db.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-            (conv_id, overflow_count),
-        )
-        overflow_msgs = await cursor.fetchall()
-
-        if not overflow_msgs:
-            return
-
-        # Get current CC summary
-        cursor = await db.execute(
-            "SELECT summary_text FROM conversation_context WHERE conversation_id = ?",
-            (conv_id,),
-        )
-        row = await cursor.fetchone()
-        current_summary = row[0] if row else ""
-
-        # Build text of overflow messages
-        overflow_text = "\n".join(f"[{m[0]}]: {m[1]}" for m in overflow_msgs)
-
-        # Call Groq to fold into summary
-        new_summary = await self._summarize_cc(current_summary, overflow_text)
-        if new_summary:
-            await db.execute(
-                "UPDATE conversation_context SET summary_text = ?, updated_at = ? WHERE conversation_id = ?",
-                (new_summary, time.time(), conv_id),
-            )
-
-            # Only delete overflow messages if summarization succeeded
-            cursor = await db.execute(
-                "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-                (conv_id, overflow_count),
-            )
-            ids_to_delete = [r[0] for r in await cursor.fetchall()]
-            if ids_to_delete:
-                placeholders = ",".join(["?"] * len(ids_to_delete))
-                await db.execute(
-                    f"DELETE FROM messages WHERE id IN ({placeholders})", ids_to_delete
-                )
-
-            await db.commit()
-        else:
-            logger.warning(
-                f"CC summarization failed for conversation {conv_id} — overflow messages preserved"
-            )
 
     async def _summarize_cc(
         self, current_summary: str, new_messages: str
@@ -448,9 +384,7 @@ class Memory:
                 )
 
             # Process adds (merged memories)
-            import time as _time
-
-            now = _time.time()
+            now = time.time()
             for new_mem in data.get("add", []):
                 if isinstance(new_mem, str) and new_mem.strip():
                     if table == "episodic_memories":
@@ -580,84 +514,7 @@ class Memory:
 
             return {"summary": summary, "messages": messages}
 
-    async def get_today_conversation_summaries(self) -> str:
-        """Get summaries of all closed conversations from today."""
-        today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-        # Get start of today in epoch
-        today_start = datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-        today_epoch = today_start.timestamp()
 
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                (today_epoch,),
-            )
-            rows = await cursor.fetchall()
-
-        if not rows:
-            return "(No earlier conversations today)"
-
-        parts = []
-        for i, (summary,) in enumerate(rows, 1):
-            parts.append(f"{i}. {summary}")
-        return "\n".join(parts)
-
-    async def get_semantic_memories(self) -> str:
-        """Get all semantic memories."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT content FROM semantic_memories ORDER BY created_at DESC"
-            )
-            rows = await cursor.fetchall()
-
-        if not rows:
-            return "(No semantic memories)"
-
-        return "\n".join(f"• {r[0]}" for r in rows)
-
-    async def get_appropriate_memories(self, user_text: str) -> str:
-        """Use a fast Groq model to filter episodic memories for relevance."""
-        if not self.groq_client:
-            return "(No episodic memory filter available)"
-
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT id, content FROM episodic_memories ORDER BY created_at DESC"
-            )
-            rows = await cursor.fetchall()
-
-        if not rows:
-            return "(No episodic memories)"
-
-        memories_text = "\n".join(f"[{r[0]}] {r[1]}" for r in rows)
-
-        prompt = (
-            f"User's current message: {user_text}\n\n"
-            f"Here are all stored episodic memories:\n{memories_text}\n\n"
-            "Which of these memories are relevant to the user's current message? "
-            "Return ONLY the IDs of relevant memories as a JSON array, like [1, 5, 12]. "
-            "If none are relevant, return []. Output ONLY the JSON array."
-        )
-
-        data = await self._call_groq_json(
-            prompt,
-            system="You filter memories for relevance. Output ONLY a JSON array of IDs.",
-            model=self.filter_model,
-            temperature=0.1,
-        )
-
-        if data is None:
-            return "(Memory filter unavailable)"
-
-        if not isinstance(data, list) or not data:
-            return "(No relevant episodic memories)"
-
-        # Fetch the relevant ones
-        relevant = [r[1] for r in rows if r[0] in data]
-        if not relevant:
-            return "(No relevant episodic memories)"
-
-        return "\n".join(f"• {m}" for m in relevant)
 
     @staticmethod
     def _coerce_id_list(values: Any) -> List[int]:
@@ -1234,89 +1091,6 @@ class Memory:
                 f"Weekly cleanup: deleted {len(delete_ids)} memories. Reason: {reason}"
             )
 
-    # ── Recall Memory (Tool) ───────────────────────────────
-
-    async def recall_memory(
-        self, query_type: str, date: str = "", time_range: str = ""
-    ) -> str:
-        """Retrieve stored memories for the user.
-        query_type: 'conversation' | 'day' | 'global'
-        date: YYYY-MM-DD (required for 'conversation' and 'day')
-        time_range: HH:MM-HH:MM (required for 'conversation')
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            if query_type == "global":
-                cursor = await db.execute(
-                    "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
-                )
-                row = await cursor.fetchone()
-                return row[0] if row else "No global memory stored yet."
-
-            elif query_type == "day":
-                if not date:
-                    return "Error: date is required for day query (format: YYYY-MM-DD)"
-                cursor = await db.execute(
-                    "SELECT summary FROM day_memories WHERE date = ?", (date,)
-                )
-                row = await cursor.fetchone()
-                if row:
-                    return row[0]
-
-                # Fallback: get conversation summaries for that day
-                try:
-                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
-                        tzinfo=TIMEZONE
-                    )
-                    day_start = day_dt.timestamp()
-                    day_end = (day_dt + timedelta(days=1)).timestamp()
-                    cursor = await db.execute(
-                        "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                        (day_start, day_end),
-                    )
-                    rows = await cursor.fetchall()
-                    if rows:
-                        return (
-                            "No day summary yet, but here are the conversation summaries:\n"
-                            + "\n".join(f"- {r[0]}" for r in rows)
-                        )
-                except ValueError:
-                    return f"Invalid date format: {date}. Use YYYY-MM-DD."
-                return f"No memories found for {date}."
-
-            elif query_type == "conversation":
-                if not date or not time_range:
-                    return "Error: both date and time_range required for conversation query"
-                try:
-                    # Parse time range
-                    parts = time_range.split("-")
-                    if len(parts) != 2:
-                        return (
-                            f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
-                        )
-                    start_str, end_str = parts
-                    day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
-                        tzinfo=TIMEZONE
-                    )
-                    sh, sm = map(int, start_str.strip().split(":"))
-                    eh, em = map(int, end_str.strip().split(":"))
-                    range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
-                    range_end = day_dt.replace(hour=eh, minute=em).timestamp()
-
-                    cursor = await db.execute(
-                        "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                        (range_start, range_end),
-                    )
-                    rows = await cursor.fetchall()
-                    if rows:
-                        return "\n\n".join(r[0] for r in rows)
-                    return (
-                        f"No conversations found in time range {time_range} on {date}."
-                    )
-                except (ValueError, IndexError) as e:
-                    return f"Error parsing query: {e}"
-            else:
-                return f"Unknown query_type: {query_type}. Use 'global', 'day', or 'conversation'."
-
     # ── Groq Helpers ────────────────────────────────────────
 
     async def _call_groq(
@@ -1469,193 +1243,3 @@ class Memory:
             await db.execute("DELETE FROM day_memories")
             await db.execute("DELETE FROM global_memory")
             await db.commit()
-
-    # ── Sync Methods (for Gemini AFC tools) ────────────────
-
-    def recall_memory_sync(
-        self, query_type: str, date: str = "", time_range: str = ""
-    ) -> str:
-        """Sync version of recall_memory — uses plain sqlite3 so it's safe inside AFC."""
-        import sqlite3
-
-        with self._sync_lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                if query_type == "global":
-                    row = conn.execute(
-                        "SELECT summary FROM global_memory ORDER BY id DESC LIMIT 1"
-                    ).fetchone()
-                    return row[0] if row else "No global memory stored yet."
-
-                elif query_type == "day":
-                    if not date:
-                        return (
-                            "Error: date is required for day query (format: YYYY-MM-DD)"
-                        )
-                    row = conn.execute(
-                        "SELECT summary FROM day_memories WHERE date = ?", (date,)
-                    ).fetchone()
-                    if row:
-                        return row[0]
-                    try:
-                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
-                            tzinfo=TIMEZONE
-                        )
-                        day_start = day_dt.timestamp()
-                        day_end = (day_dt + timedelta(days=1)).timestamp()
-                        rows = conn.execute(
-                            "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at < ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                            (day_start, day_end),
-                        ).fetchall()
-                        if rows:
-                            return (
-                                "No day summary yet, but here are the conversation summaries:\n"
-                                + "\n".join(f"- {r[0]}" for r in rows)
-                            )
-                    except ValueError:
-                        return f"Invalid date format: {date}. Use YYYY-MM-DD."
-                    return f"No memories found for {date}."
-
-                elif query_type == "conversation":
-                    if not date or not time_range:
-                        return "Error: both date and time_range required for conversation query"
-                    try:
-                        parts = time_range.split("-")
-                        if len(parts) != 2:
-                            return f"Invalid time_range format: {time_range}. Use HH:MM-HH:MM."
-                        start_str, end_str = parts
-                        day_dt = datetime.strptime(date, "%Y-%m-%d").replace(
-                            tzinfo=TIMEZONE
-                        )
-                        sh, sm = map(int, start_str.strip().split(":"))
-                        eh, em = map(int, end_str.strip().split(":"))
-                        range_start = day_dt.replace(hour=sh, minute=sm).timestamp()
-                        range_end = day_dt.replace(hour=eh, minute=em).timestamp()
-                        rows = conn.execute(
-                            "SELECT summary FROM conversations WHERE is_closed = 1 AND started_at >= ? AND started_at <= ? AND summary IS NOT NULL ORDER BY started_at ASC",
-                            (range_start, range_end),
-                        ).fetchall()
-                        if rows:
-                            return "\n\n".join(r[0] for r in rows)
-                        return f"No conversations found in time range {time_range} on {date}."
-                    except (ValueError, IndexError) as e:
-                        return f"Error parsing query: {e}"
-                else:
-                    return f"Unknown query_type: {query_type}. Use 'global', 'day', or 'conversation'."
-            finally:
-                conn.close()
-
-    def list_memories_sync(self, memory_type: str) -> str:
-        """List episodic or semantic memories with their IDs."""
-        import sqlite3
-
-        with self._sync_lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                if memory_type == "episodic":
-                    rows = conn.execute(
-                        "SELECT id, content, created_at FROM episodic_memories ORDER BY created_at DESC"
-                    ).fetchall()
-                    if not rows:
-                        return "No episodic memories stored."
-                    parts = []
-                    for id_, content, created_at in rows:
-                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime(
-                            "%Y-%m-%d %H:%M"
-                        )
-                        parts.append(f"[E{id_}] ({dt}) {content}")
-                    total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
-                    return (
-                        f"Episodic memories ({len(rows)} items, ~{total_tokens}/{MAX_EPISODIC_TOKENS} tokens):\n"
-                        + "\n".join(parts)
-                    )
-
-                elif memory_type == "semantic":
-                    rows = conn.execute(
-                        "SELECT id, content, created_at FROM semantic_memories ORDER BY created_at DESC"
-                    ).fetchall()
-                    if not rows:
-                        return "No semantic memories stored."
-                    parts = []
-                    for id_, content, created_at in rows:
-                        dt = datetime.fromtimestamp(created_at, tz=TIMEZONE).strftime(
-                            "%Y-%m-%d %H:%M"
-                        )
-                        parts.append(f"[S{id_}] ({dt}) {content}")
-                    total_tokens = sum(Memory._estimate_tokens(c) for _, c, _ in rows)
-                    return (
-                        f"Semantic memories ({len(rows)} items, ~{total_tokens}/{MAX_SEMANTIC_TOKENS} tokens):\n"
-                        + "\n".join(parts)
-                    )
-                else:
-                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
-            finally:
-                conn.close()
-
-    def delete_memory_sync(self, memory_type: str, memory_id: int) -> str:
-        """Delete a specific episodic or semantic memory by ID."""
-        import sqlite3
-
-        with self._sync_lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                if memory_type == "episodic":
-                    if not conn.execute(
-                        "SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)
-                    ).fetchone():
-                        return f"Episodic memory E{memory_id} not found."
-                    conn.execute(
-                        "DELETE FROM episodic_memories WHERE id = ?", (memory_id,)
-                    )
-                    conn.commit()
-                    return f"Deleted episodic memory E{memory_id}."
-                elif memory_type == "semantic":
-                    if not conn.execute(
-                        "SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)
-                    ).fetchone():
-                        return f"Semantic memory S{memory_id} not found."
-                    conn.execute(
-                        "DELETE FROM semantic_memories WHERE id = ?", (memory_id,)
-                    )
-                    conn.commit()
-                    return f"Deleted semantic memory S{memory_id}."
-                else:
-                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
-            finally:
-                conn.close()
-
-    def edit_memory_sync(
-        self, memory_type: str, memory_id: int, new_content: str
-    ) -> str:
-        """Edit the content of a specific episodic or semantic memory."""
-        import sqlite3
-
-        with self._sync_lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                if memory_type == "episodic":
-                    if not conn.execute(
-                        "SELECT id FROM episodic_memories WHERE id = ?", (memory_id,)
-                    ).fetchone():
-                        return f"Episodic memory E{memory_id} not found."
-                    conn.execute(
-                        "UPDATE episodic_memories SET content = ? WHERE id = ?",
-                        (new_content, memory_id),
-                    )
-                    conn.commit()
-                    return f"Updated episodic memory E{memory_id}."
-                elif memory_type == "semantic":
-                    if not conn.execute(
-                        "SELECT id FROM semantic_memories WHERE id = ?", (memory_id,)
-                    ).fetchone():
-                        return f"Semantic memory S{memory_id} not found."
-                    conn.execute(
-                        "UPDATE semantic_memories SET content = ? WHERE id = ?",
-                        (new_content, memory_id),
-                    )
-                    conn.commit()
-                    return f"Updated semantic memory S{memory_id}."
-                else:
-                    return f"Unknown memory_type: {memory_type}. Use 'episodic' or 'semantic'."
-            finally:
-                conn.close()
